@@ -1,0 +1,66 @@
+name: Paper trading
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_sec:
+        description: "Run duration in seconds (max 21000 = 6h)"
+        required: false
+        default: "3600"
+      wait_sec:
+        description: "Seconds to wait after showing the IP (time to whitelist it on Bitpin)"
+        required: false
+        default: "30"
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Detect runner IP
+        id: ip
+        run: |
+          IP=$(curl -s --max-time 10 https://api.ipify.org || curl -s --max-time 10 https://ifconfig.me)
+          echo "ip=${IP}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Bitpin API — whitelist this IP now"
+            echo ""
+            echo "**Runner IP:** \`${IP}\`"
+            echo ""
+            echo "Add it to your API key IP list on [Bitpin](https://www.bitpin.ir/settings/api-keys),"
+            echo "then the bot continues automatically after the wait."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Runner IP for Bitpin whitelist::${IP}"
+
+      - name: Wait for manual IP whitelist
+        run: |
+          WAIT=${{ github.event.inputs.wait_sec || '30' }}
+          echo "Waiting ${WAIT}s so the IP can be added on Bitpin..."
+          sleep "${WAIT}"
+
+      - name: Run paper-trading bot
+        env:
+          BITPIN_API_KEY: ${{ secrets.BITPIN_API_KEY }}
+          BITPIN_SECRET_KEY: ${{ secrets.BITPIN_SECRET_KEY }}
+        run: |
+          python -m tradebot.main --duration "${{ github.event.inputs.duration_sec || '3600' }}"
+
+      - name: Upload data and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradebot-data-${{ github.run_id }}
+          path: |
+            data/raw
+            data/reports
+          if-no-files-found: warn

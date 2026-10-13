@@ -1,0 +1,91 @@
+# =============================================================================
+# Paper-trading configuration: order-book imbalance strategy on Bitpin
+# Capital is simulated. No real orders are ever sent.
+# =============================================================================
+
+market:
+  # USDT_IRT is suspended overnight (21:00-09:00 Tehran); USDC_IRT trades 24/7.
+  symbol: USDC_IRT
+
+capital:
+  initial_irt: 1000000.0
+
+api:
+  base_url: https://api.bitpin.org
+  ws_url: wss://centrifugo.bitpin.org/connection/websocket
+  timeout_sec: 10.0
+  # REST order-book snapshot cadence; also refreshes book freshness so that
+  # quiet markets (WS pushes only on change) are not misread as stale.
+  # Respects the 60 req/min public limit.
+  resync_interval_sec: 15.0
+
+features:
+  # Depth imbalance over top-N levels, skipping the best level (level 1).
+  depth_levels: 10
+  # Exponential weight decay for depth levels: w_i = lambda ** (i - 2)
+  depth_lambda: 0.5
+  # Rolling window (seconds) of OFI snapshots used to z-score current OFI.
+  ofi_z_window_sec: 120.0
+  min_ofi_samples: 20
+  # Signal persistence: score must keep its sign over consecutive evaluation
+  # windows before an entry is allowed.
+  persistence_windows: 3
+  persistence_window_sec: 5.0
+
+scoring:
+  weight_depth: 0.40
+  weight_micro: 0.30
+  weight_ofi: 0.30
+  # Argument scale for tanh(ofi_z / ofi_scale) in the score blend.
+  ofi_scale: 2.0
+
+edge:
+  # Estimated mid-price move (fraction) at |score| = 1.0. Placeholder until
+  # calibrated from recorded data in a later phase.
+  expected_move_coef: 0.0004
+  # Minimum net edge (fraction) required to open a position.
+  required_edge: 0.0002
+  # Calibration mode: when false, entries are not blocked by the edge gate
+  # (the edge is still computed and logged in signals.csv).
+  enforce: false
+  # Fallback fees (fraction) used only if the commissions API is unavailable.
+  default_fee_taker: 0.0035
+  default_fee_maker: 0.003
+
+execution:
+  # Paper fills walk the real book: buy consumes asks, sell consumes bids.
+  max_levels_walk: 10
+  # Reject entry if resulting average slippage exceeds this fraction of mid.
+  max_slippage: 0.0015
+  # Slippage buffer applied to expected exit when pricing the edge.
+  edge_exit_slippage: 0.0005
+
+position:
+  # Hard cap on notional (IRT) per position as a fraction of current equity.
+  max_position_fraction: 0.95
+  # Cap derived from immediately tradeable depth at the touch.
+  max_touch_depth_fraction: 0.5
+
+risk:
+  stop_loss_pct: 0.004
+  take_profit_pct: 0.006
+  max_daily_loss_irt: 20000.0
+  # Observed USDT_IRT spread is often 20-40 bps; keep the gate loose enough
+  # for calibration runs and tighten once the strategy is validated.
+  max_spread_pct: 0.006
+  # WS pushes only on change, so quiet markets rely on the REST resync for
+  # freshness. Halt only if both streams stay silent beyond this window.
+  book_stale_sec: 30.0
+
+exit:
+  # Exit long if the score flips below this threshold while in position.
+  score_exit_threshold: -0.3
+  # Time-based exit as a backstop, seconds.
+  max_holding_sec: 900.0
+
+paths:
+  raw_dir: data/raw
+  reports_dir: data/reports
+
+logging:
+  level: INFO
