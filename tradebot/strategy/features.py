@@ -27,6 +27,7 @@ class Features:
     micro_m: float = 0.0
     ofi_raw: float = 0.0
     ofi_z: float = 0.0
+    ofi_samples: int = 0
     mid: float = 0.0
     spread: float = 0.0
     spread_pct: float = 0.0
@@ -157,6 +158,11 @@ class OFIEstimator:
         z = max(-3.0, min(3.0, z))
         return mean, z
 
+    @property
+    def sample_count(self) -> int:
+        """Number of OFI samples currently inside the z-window."""
+        return len(self._history)
+
 
 class SignalPersistence:
     """Requires the blended score to keep its sign over N evaluation windows."""
@@ -251,6 +257,7 @@ class FeatureEngine:
             micro_m=micro,
             ofi_raw=ofi_mean,
             ofi_z=ofi_z,
+            ofi_samples=self._ofi.sample_count,
             mid=mid,
             spread=spread,
             spread_pct=book.spread_pct or 0.0,

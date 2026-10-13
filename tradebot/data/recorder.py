@@ -14,6 +14,7 @@ class RawDataRecorder:
 
     def __init__(self, raw_dir: Path) -> None:
         raw_dir.mkdir(parents=True, exist_ok=True)
+        self._raw_dir = raw_dir
         self._book_path = raw_dir / "books.jsonl"
         self._matches_path = raw_dir / "matches.jsonl"
         self._signal_path = raw_dir / "signals.csv"
@@ -22,6 +23,12 @@ class RawDataRecorder:
         # from different schemas/runs never mix in one file.
         if self._signal_path.exists():
             self._signal_path.rename(self._archive_path(raw_dir))
+
+    def archive_signals(self) -> None:
+        """Rotate the current signals.csv (e.g. on bot restart/symbol change)."""
+        if self._signal_path.exists():
+            self._signal_path.rename(self._archive_path(self._raw_dir))
+        self._signals_initialized = False
 
     @staticmethod
     def _archive_path(raw_dir: Path) -> Path:

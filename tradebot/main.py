@@ -1,10 +1,13 @@
 """Main orchestrator: wires data, strategy, engine, and reporting.
 
-Run with:  python -m tradebot.main [--config config.yaml]
+Run with:  python -m tradebot.main [--config config.yaml] [--duration SEC]
 
 The bot connects to Bitpin public WebSocket channels, computes the four
-order-book-imbalance features, and simulates a long-only USDT/IRT strategy
-against the live book. No real orders are ever placed.
+order-book-imbalance features, and simulates a long-only strategy against
+the live book. No real orders are ever placed.
+
+Trading can be stopped/started and the symbol switched at runtime from the
+local dashboard (http://127.0.0.1:8765) without restarting the process.
 """
 
 from __future__ import annotations
@@ -14,10 +17,12 @@ import asyncio
 import logging
 import signal
 import time
+from typing import Any
 
-from tradebot.api.rest_client import BitpinRestClient
+from tradebot.api.rest_client import BitpinRestClient, CommissionInfo
 from tradebot.api.ws_client import BitpinWsClient
 from tradebot.config import Config, load_config
+from tradebot.dashboard import DashboardServer, DashboardState
 from tradebot.data.orderbook import OrderBookState
 from tradebot.data.recorder import RawDataRecorder
 from tradebot.data.trades import TradesStream
@@ -31,49 +36,242 @@ from tradebot.strategy.scoring import Scorer
 
 logger = logging.getLogger("tradebot")
 
+_SYMBOLS_CACHE_SEC = 120.0
+
 
 class TradingBot:
-    """Single-symbol paper-trading bot."""
+    """Single-symbol paper-trading bot with runtime start/stop/symbol switch."""
 
     def __init__(self, config: Config) -> None:
         self._config = config
         self._rest = BitpinRestClient(config)
+        self._recorder = RawDataRecorder(config.paths.raw_dir)
+        self._exits = ExitRules(config.exit, config.risk)
+        self._dashboard_state = DashboardState(
+            max_history=config.dashboard.history_max_points
+        )
+        self._dashboard: DashboardServer | None = None
+        self._stop_event = asyncio.Event()
+        self._eval_interval: float = max(
+            0.5,
+            config.features.persistence_window_sec
+            / max(config.features.persistence_windows, 1),
+        )
+
+        # Per-run state (recreated by start_trading)
+        self._symbol: str = config.market.symbol
+        self._commission: CommissionInfo | None = None
         self._book_state = OrderBookState()
         self._trades = TradesStream(window_sec=config.features.ofi_z_window_sec)
-        self._recorder = RawDataRecorder(config.paths.raw_dir)
         self._features: FeatureEngine | None = None
         self._scorer: Scorer | None = None
         self._edge: EdgeEstimator | None = None
         self._engine: PaperEngine | None = None
         self._risk = RiskManager(config.risk, config.position)
-        self._exits = ExitRules(config.exit, config.risk)
         self._report: ReportWriter | None = None
         self._ws: BitpinWsClient | None = None
-        self._stop_event = asyncio.Event()
-        self._last_eval_at: float = 0.0
+        self._tasks: list[asyncio.Task] = []
+        self._trading = False
         self._last_status_at: float = 0.0
-        self._last_resync_at: float = 0.0
-        self._eval_interval: float = max(
-            0.5, config.features.persistence_window_sec
-            / max(config.features.persistence_windows, 1)
-        )
+
+        # Tradable-symbol list cache for the dashboard selector
+        self._symbols_cache: list[str] = []
+        self._symbols_fetched_at: float = 0.0
+        self._status_error: str = ""
 
     # ------------------------------------------------------------------
-    # Callbacks from WebSocket (called from the asyncio loop)
+    # Status / control API (used by the dashboard server)
+    # ------------------------------------------------------------------
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "running": self._trading,
+            "symbol": self._symbol,
+            "error": self._status_error,
+        }
+
+    async def symbols(self) -> list[str]:
+        now = time.time()
+        if (
+            self._symbols_cache
+            and now - self._symbols_fetched_at < _SYMBOLS_CACHE_SEC
+        ):
+            return self._symbols_cache
+        markets = await self._rest.list_markets()
+        # Capital is in IRT, so only IRT-quoted markets are tradeable here.
+        symbols = sorted(
+            m["symbol"]
+            for m in markets
+            if m.get("tradable")
+            and not m.get("suspended")
+            and m["symbol"].endswith("_IRT")
+        )
+        self._symbols_cache = symbols
+        self._symbols_fetched_at = now
+        return symbols
+
+    async def start_trading(self, symbol: str | None = None) -> dict[str, Any]:
+        """(Re)start the trading loop on ``symbol`` (default: current)."""
+        if self._trading:
+            raise RuntimeError(
+                "Trading is already running — stop it before starting again"
+            )
+        try:
+            status = await self._start_trading_impl(symbol)
+        except Exception as exc:  # noqa: BLE001
+            self._status_error = str(exc)
+            self._dashboard_state.set_status(False, self._symbol, str(exc))
+            raise
+        self._status_error = ""
+        return status
+
+    async def _start_trading_impl(self, symbol: str | None) -> dict[str, Any]:
+        target = (symbol or self._symbol).upper().strip()
+        cfg = self._config
+
+        logger.info("Starting trading on %s ...", target)
+        market = await self._rest.get_market_info(target)
+        if market.suspended:
+            raise RuntimeError(
+                f"Market {target} is suspended right now "
+                "(e.g. USDT_IRT is closed 21:00-09:00 Tehran)"
+            )
+        if not market.tradable:
+            raise RuntimeError(f"Market {target} is not tradable")
+
+        try:
+            commission = await self._rest.get_commission(target)
+            logger.info(
+                "Commission %s: maker=%.4f%% taker=%.4f%%",
+                target,
+                commission.maker_fraction * 100,
+                commission.taker_fraction * 100,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Commission fetch failed; using config defaults for %s", target
+            )
+            commission = CommissionInfo(
+                maker=cfg.edge.default_fee_maker,
+                taker=cfg.edge.default_fee_taker,
+            )
+
+        snapshot = await self._rest.get_orderbook_snapshot(target)
+
+        # Fresh per-run state
+        self._symbol = target
+        self._commission = commission
+        self._book_state = OrderBookState()
+        self._book_state.apply_rest_snapshot(snapshot)
+        if not self._book_state.book.is_valid():
+            raise RuntimeError(f"Initial order-book snapshot invalid for {target}")
+        logger.info(
+            "Initial book %s: bid=%.2f ask=%.2f spread=%.2f",
+            target,
+            self._book_state.book.best_bid.price,  # type: ignore[union-attr]
+            self._book_state.book.best_ask.price,  # type: ignore[union-attr]
+            self._book_state.book.spread,  # type: ignore[union-attr]
+        )
+
+        self._trades = TradesStream(window_sec=cfg.features.ofi_z_window_sec)
+        self._features = FeatureEngine(cfg.features, self._trades)
+        self._scorer = Scorer(cfg.scoring)
+        self._edge = EdgeEstimator(cfg.edge, cfg.execution, commission)
+        self._engine = PaperEngine(cfg.capital.initial_irt, cfg.execution, commission)
+        self._risk = RiskManager(cfg.risk, cfg.position)
+        self._report = ReportWriter(cfg.paths.reports_dir, cfg.capital.initial_irt)
+        self._ws = BitpinWsClient(
+            cfg.api.ws_url,
+            target,
+            on_book=self._on_book,
+            on_matches=self._on_matches,
+        )
+        await self._ws.start()
+
+        self._recorder.archive_signals()
+        self._dashboard_state.reset_run_data()
+        self._dashboard_state.set_params(
+            self._build_dashboard_params(target, commission)
+        )
+        self._last_status_at = 0.0
+        self._trading = True
+        self._dashboard_state.set_status(True, target, "")
+
+        self._tasks = [
+            asyncio.create_task(self._eval_loop()),
+            asyncio.create_task(self._resync_loop()),
+        ]
+        logger.info(
+            "Trading started: symbol=%s capital=%.0f IRT eval_interval=%.2fs",
+            target,
+            cfg.capital.initial_irt,
+            self._eval_interval,
+        )
+        return self.status()
+
+    async def stop_trading(self, reason: str = "manual") -> dict[str, Any]:
+        """Stop the trading loop; force-close any open paper position."""
+        if not self._trading:
+            return self.status()
+        logger.info("Stopping trading (%s) ...", reason)
+
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+
+        if self._ws is not None:
+            try:
+                await self._ws.stop()
+            except Exception:  # noqa: BLE001
+                logger.debug("WS stop failed during stop_trading", exc_info=True)
+            self._ws = None
+
+        engine = self._engine
+        report = self._report
+        if engine is not None and report is not None:
+            book = self._book_state.book
+            trade = None
+            if engine.account.state.value == "long" and book.is_valid():
+                trade = engine.try_exit_long(book, ExitReason.MANUAL_RISK)
+                if trade is not None:
+                    self._risk.register_realized_pnl(
+                        trade.pnl_irt, time.time()
+                    )
+                    report.record_closed_trade(trade, engine.account)
+                    logger.info(
+                        "Force-closed open position on stop: pnl=%.0f IRT",
+                        trade.pnl_irt,
+                    )
+            mark = book.best_bid.price if book.best_bid else 0.0
+            summary = report.write_summary(engine.account, mark_price=mark)
+            report.log_summary(summary)
+            logger.info("Reports written to %s", self._config.paths.reports_dir)
+
+        self._trading = False
+        self._status_error = ""
+        self._dashboard_state.set_status(False, self._symbol, "")
+        return self.status()
+
+    # ------------------------------------------------------------------
+    # WebSocket callbacks (per-run; bound to the current WS client)
     # ------------------------------------------------------------------
 
     def _on_book(self, payload: dict) -> None:
         self._book_state.apply_snapshot(payload)
         self._recorder.record_book(payload)
+        if self._book_state.book.is_valid():
+            self._dashboard_state.on_book(self._book_state.book, time.time())
         if self._features is not None and self._book_state.book.is_valid():
             self._features.on_book(self._book_state.book)
 
     def _on_matches(self, payload: dict) -> None:
         self._trades.apply_matches(payload)
         self._recorder.record_matches(payload)
+        self._dashboard_state.on_matches(payload)
 
     # ------------------------------------------------------------------
-    # Setup
+    # Durable setup (once per process)
     # ------------------------------------------------------------------
 
     async def setup(self) -> None:
@@ -95,65 +293,63 @@ class TradingBot:
                 "No API credentials configured; continuing unauthenticated"
             )
 
-        logger.info("Fetching market info for %s", cfg.market.symbol)
-        market = await self._rest.get_market_info(cfg.market.symbol)
-        if market.suspended:
-            raise RuntimeError(
-                f"Market {market.symbol} is suspended right now "
-                "(e.g. USDT_IRT is closed overnight 21:00-09:00 Tehran)"
+        if cfg.dashboard.enabled:
+            self._dashboard = DashboardServer(
+                self._dashboard_state,
+                host=cfg.dashboard.host,
+                port=cfg.dashboard.port,
+                controller=self,
             )
-        if not market.tradable:
-            raise RuntimeError(f"Market {market.symbol} is not tradable")
+            await self._dashboard.start()
 
-        logger.info("Fetching commission for %s", cfg.market.symbol)
-        try:
-            commission = await self._rest.get_commission(cfg.market.symbol)
-            logger.info(
-                "Commission: maker=%.4f%% taker=%.4f%%",
-                commission.maker_fraction * 100,
-                commission.taker_fraction * 100,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Commission fetch failed (%s); using config defaults", exc
-            )
-            from tradebot.api.rest_client import CommissionInfo
-
-            commission = CommissionInfo(
-                maker=cfg.edge.default_fee_maker,
-                taker=cfg.edge.default_fee_taker,
-            )
-
-        logger.info("Fetching initial order-book snapshot (REST)...")
-        snapshot = await self._rest.get_orderbook_snapshot(cfg.market.symbol)
-        self._book_state.apply_rest_snapshot(snapshot)
-        if not self._book_state.book.is_valid():
-            raise RuntimeError("Initial order-book snapshot invalid")
-        logger.info(
-            "Initial book: bid=%.2f ask=%.2f spread=%.2f",
-            self._book_state.book.best_bid.price,  # type: ignore[union-attr]
-            self._book_state.book.best_ask.price,  # type: ignore[union-attr]
-            self._book_state.book.spread,  # type: ignore[union-attr]
-        )
-
-        self._features = FeatureEngine(cfg.features, self._trades)
-        self._scorer = Scorer(cfg.scoring)
-        self._edge = EdgeEstimator(cfg.edge, cfg.execution, commission)
-        self._engine = PaperEngine(
-            cfg.capital.initial_irt,
-            cfg.execution,
-            commission,
-        )
-        self._report = ReportWriter(
-            cfg.paths.reports_dir,
-            cfg.capital.initial_irt,
-        )
-        self._ws = BitpinWsClient(
-            cfg.api.ws_url,
-            cfg.market.symbol,
-            on_book=self._on_book,
-            on_matches=self._on_matches,
-        )
+    def _build_dashboard_params(
+        self, symbol: str, commission: CommissionInfo
+    ) -> dict:
+        cfg = self._config
+        return {
+            "symbol": symbol,
+            "capital_irt": cfg.capital.initial_irt,
+            "eval_interval_sec": round(self._eval_interval, 2),
+            "features": {
+                "depth_levels": cfg.features.depth_levels,
+                "depth_lambda": cfg.features.depth_lambda,
+                "ofi_z_window_sec": cfg.features.ofi_z_window_sec,
+                "min_ofi_samples": cfg.features.min_ofi_samples,
+                "persistence_windows": cfg.features.persistence_windows,
+                "persistence_window_sec": cfg.features.persistence_window_sec,
+            },
+            "scoring": {
+                "weight_depth": cfg.scoring.weight_depth,
+                "weight_micro": cfg.scoring.weight_micro,
+                "weight_ofi": cfg.scoring.weight_ofi,
+                "ofi_scale": cfg.scoring.ofi_scale,
+            },
+            "edge": {
+                "expected_move_coef": cfg.edge.expected_move_coef,
+                "required_edge": cfg.edge.required_edge,
+                "enforce": cfg.edge.enforce,
+            },
+            "risk": {
+                "stop_loss_pct": cfg.risk.stop_loss_pct,
+                "take_profit_pct": cfg.risk.take_profit_pct,
+                "max_daily_loss_irt": cfg.risk.max_daily_loss_irt,
+                "max_spread_pct": cfg.risk.max_spread_pct,
+                "book_stale_sec": cfg.risk.book_stale_sec,
+            },
+            "exit": {
+                "score_exit_threshold": cfg.exit.score_exit_threshold,
+                "max_holding_sec": cfg.exit.max_holding_sec,
+            },
+            "execution": {
+                "max_levels_walk": cfg.execution.max_levels_walk,
+                "max_slippage": cfg.execution.max_slippage,
+                "edge_exit_slippage": cfg.execution.edge_exit_slippage,
+            },
+            "fees": {
+                "maker": commission.maker_fraction,
+                "taker": commission.taker_fraction,
+            },
+        }
 
     # ------------------------------------------------------------------
     # Periodic tasks
@@ -162,16 +358,14 @@ class TradingBot:
     async def _resync_loop(self) -> None:
         """Pull a REST snapshot periodically to guard against WS gaps.
 
-        The orderbook WS channel only pushes on change, so in quiet markets
-        this resync is also what keeps the staleness gate satisfied.
+        The orderbook WS channel only pushes on change, so during quiet
+        markets this resync is also what keeps the staleness gate satisfied.
         """
         interval = self._config.api.resync_interval_sec
-        while not self._stop_event.is_set():
+        while self._trading:
             await asyncio.sleep(interval)
             try:
-                snapshot = await self._rest.get_orderbook_snapshot(
-                    self._config.market.symbol
-                )
+                snapshot = await self._rest.get_orderbook_snapshot(self._symbol)
                 self._book_state.apply_rest_snapshot(snapshot)
                 logger.debug("Order book resynced from REST")
             except Exception as exc:  # noqa: BLE001
@@ -179,7 +373,7 @@ class TradingBot:
 
     async def _eval_loop(self) -> None:
         """Core decision loop, driven by wall clock, not by message rate."""
-        while not self._stop_event.is_set():
+        while self._trading:
             await asyncio.sleep(self._eval_interval)
             try:
                 self._evaluate_once()
@@ -226,8 +420,9 @@ class TradingBot:
         if now - self._last_status_at >= 30.0:
             self._last_status_at = now
             logger.info(
-                "status mid=%.0f spread=%.0f bps book_age=%.1fs score=%+.3f "
+                "status %s mid=%.0f spread=%.0f bps book_age=%.1fs score=%+.3f "
                 "persistent=%s pos=%s equity=%.0f IRT",
+                self._symbol,
                 feats.mid,
                 feats.spread_pct * 10000 if feats.valid else -1,
                 book.age_sec(now),
@@ -342,6 +537,7 @@ class TradingBot:
                 "action": action,
             }
         )
+        self._update_dashboard(feats, score, persistent, dominant, action, now)
 
     def _record_signal_raw(self, now: float, action: str) -> None:
         """Record a row even when features could not be computed."""
@@ -360,19 +556,43 @@ class TradingBot:
                 "action": action,
             }
         )
+        self._update_dashboard(None, 0.0, False, 0, action, now)
+
+    def _update_dashboard(
+        self, feats, score: float, persistent: bool, dominant: int,
+        action: str, now: float,
+    ) -> None:
+        if self._dashboard is None or self._engine is None:
+            return
+        self._dashboard_state.on_eval(
+            feats=feats,
+            score=score,
+            persistent=persistent,
+            dominant=dominant,
+            action=action,
+            engine=self._engine,
+            book=self._book_state.book,
+            halted=self._risk.halted,
+            halt_reason=self._risk.halt_reason or "",
+            now=now,
+        )
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Process lifecycle
     # ------------------------------------------------------------------
 
     async def run(self, duration_sec: float | None = None) -> None:
         await self.setup()
-        assert self._ws is not None and self._report is not None
 
-        await self._ws.start()
-
-        eval_task = asyncio.create_task(self._eval_loop())
-        resync_task = asyncio.create_task(self._resync_loop())
+        try:
+            await self.start_trading()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Initial start failed (%s) — dashboard stays up; "
+                "use Start after fixing the issue",
+                exc,
+            )
+            self._dashboard_state.set_status(False, self._symbol, str(exc))
 
         deadline_task: asyncio.Task | None = None
         if duration_sec is not None:
@@ -382,13 +602,6 @@ class TradingBot:
 
             deadline_task = asyncio.create_task(_deadline())
 
-        logger.info(
-            "Bot running: symbol=%s capital=%.0f IRT eval_interval=%.1fs",
-            self._config.market.symbol,
-            self._config.capital.initial_irt,
-            self._eval_interval,
-        )
-
         try:
             await self._stop_event.wait()
         except asyncio.CancelledError:
@@ -396,35 +609,23 @@ class TradingBot:
         finally:
             if deadline_task is not None:
                 deadline_task.cancel()
-            await asyncio.shield(self._shutdown(eval_task, resync_task))
+            await asyncio.shield(self._shutdown())
 
-    async def _shutdown(
-        self,
-        eval_task: asyncio.Task,
-        resync_task: asyncio.Task,
-    ) -> None:
+    async def _shutdown(self) -> None:
         logger.info("Shutting down...")
-        for task in (eval_task, resync_task):
-            task.cancel()
-        await asyncio.gather(eval_task, resync_task, return_exceptions=True)
-        if self._ws is not None:
+        try:
+            await self.stop_trading("shutdown")
+        except Exception:  # noqa: BLE001
+            logger.debug("stop_trading failed during shutdown", exc_info=True)
+        if self._dashboard is not None:
             try:
-                await self._ws.stop()
+                await self._dashboard.stop()
             except Exception:  # noqa: BLE001
-                logger.debug("WS stop failed during shutdown", exc_info=True)
+                logger.debug("Dashboard stop failed during shutdown", exc_info=True)
         try:
             await self._rest.close()
         except Exception:  # noqa: BLE001
             logger.debug("REST close failed during shutdown", exc_info=True)
-
-        engine = self._engine
-        report = self._report
-        if engine is not None and report is not None:
-            final_book = self._book_state.book
-            mark = final_book.best_bid.price if final_book.best_bid else 0.0
-            summary = report.write_summary(engine.account, mark_price=mark)
-            report.log_summary(summary)
-            logger.info("Reports written to %s", self._config.paths.reports_dir)
 
     def request_stop(self) -> None:
         self._stop_event.set()

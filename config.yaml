@@ -4,7 +4,10 @@
 # =============================================================================
 
 market:
-  # USDT_IRT is suspended overnight (21:00-09:00 Tehran); USDC_IRT trades 24/7.
+  # Initial symbol when the process starts. Can be changed at runtime from
+  # the dashboard (Stop -> pick symbol -> Start) without editing this file.
+  # Note: USDT_IRT is suspended overnight (21:00-09:00 Tehran);
+  # USDC_IRT trades 24/7.
   symbol: USDC_IRT
 
 capital:
@@ -89,3 +92,10 @@ paths:
 
 logging:
   level: INFO
+
+dashboard:
+  # Local browser dashboard: price chart, order book, features, decisions.
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+  history_max_points: 2000

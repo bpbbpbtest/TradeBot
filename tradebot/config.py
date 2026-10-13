@@ -98,6 +98,14 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class DashboardConfig:
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 8765
+    history_max_points: int = 2000
+
+
+@dataclass(frozen=True)
 class Config:
     market: MarketConfig
     capital: CapitalConfig
@@ -111,6 +119,7 @@ class Config:
     exit: ExitConfig
     paths: PathsConfig
     logging: LoggingConfig
+    dashboard: DashboardConfig
 
 
 def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
@@ -162,4 +171,5 @@ def load_config(config_path: str | Path = "config.yaml") -> Config:
             reports_dir=Path(paths["reports_dir"]),
         ),
         logging=LoggingConfig(**_section(raw, "logging")),
+        dashboard=DashboardConfig(**(raw.get("dashboard") or {})),
     )

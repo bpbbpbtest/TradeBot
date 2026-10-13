@@ -130,6 +130,19 @@ class BitpinRestClient:
                 return info
         raise LookupError(f"Market not found: {symbol}")
 
+    async def list_markets(self) -> list[dict]:
+        """Public market list (symbol/tradable/suspended) for the UI selector."""
+        response = await self._http.get("/api/v1/mkt/markets/")
+        response.raise_for_status()
+        return [
+            {
+                "symbol": item["symbol"],
+                "tradable": bool(item.get("tradable", False)),
+                "suspended": bool(item.get("suspended", False)),
+            }
+            for item in response.json()
+        ]
+
     @property
     def market_info(self) -> MarketInfo | None:
         return self._market_info
