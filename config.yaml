@@ -11,7 +11,7 @@ market:
   symbol: USDT_IRT
 
 capital:
-  initial_irt: 1000000.0
+  initial_irt: 1050000.0
 
 api:
   base_url: https://api.bitpin.org
@@ -84,19 +84,24 @@ execution:
 
 position:
   # Hard cap on notional (IRT) per position as a fraction of current equity.
-  max_position_fraction: 0.95
+  # ~1,000,000 IRT per trade on 1,050,000 capital (= 1000000/1050000).
+  # Fallback only; the fixed notional below takes precedence.
+  max_position_fraction: 0.952381
+  # Fixed per-trade notional (IRT): sizing ignores equity drift and stays
+  # at exactly this value; cash and touch-depth limits still apply.
+  max_notional_irt: 1000000.0
   # Cap derived from immediately tradeable depth at the touch.
   max_touch_depth_fraction: 0.5
 
 risk:
-  # Measured on recorded USDT_IRT data (score>=0.15 entries, 900s horizon):
-  # worst adverse excursion -26 bps, best favorable +29 bps, median spread
-  # ~16 bps. Stop sits just beyond the observed tail as a crash guard.
-  stop_loss_pct: 0.0030
-  # Take profit sits where price actually tops out (p90-p95 of favorable
-  # excursions). Note: 25 bps is still below the ~70 bps round-trip fee, so
-  # this only cuts losses earlier; it does not create profit by itself.
-  take_profit_pct: 0.0025
+  # Crash guard only — widened fee-aware. Round-trip taker fees are ~70 bps
+  # (0.35%/side), so a tight stop just converts market noise into locked-in
+  # fee loss. 100 bps gives the position room while still capping disasters.
+  stop_loss_pct: 0.0100
+  # Fee hurdle: TP must clear round-trip taker fees (~70 bps) plus a real
+  # edge. 90 bps = 70 fees + 20 net. A TP below the hurdle guarantees a
+  # negative result even when price moves in our favor.
+  take_profit_pct: 0.0090
   max_daily_loss_irt: 1000000
   # ^ Testing: effectively disabled (equals the full initial capital, so the
   #   halt never triggers). Restore to e.g. 20000.0 for realistic sessions.
@@ -122,6 +127,37 @@ exit:
   # The streak accrues during min_hold, so a sustained negative score
   # exits as soon as the min hold allows.
   score_exit_windows: 3
+
+maker:
+  # Paper maker engine: runs in parallel to the taker engine on the same
+  # signals. Virtual resting-limit orders, filled only when public trades /
+  # the book prove price traded through our level (conservative queue
+  # assumption). No real orders, no API keys. Purpose: measure whether
+  # passive execution (0.30%/side maker) beats aggressive (0.35% taker).
+  enabled: true
+  # Same entry gate as the taker engine so both see identical signals.
+  min_score: 0.15
+  # Rest exactly at the touch by default (0 bps join).
+  join_offset_bps: 0.0
+  # Cancel+replace the resting order if the touch moves more than this.
+  repeg_bps: 5.0
+  # Give up on the entry after this long without a fill; cooldown equals
+  # the timeout so one signal episode gets at most one entry window.
+  entry_timeout_sec: 60.0
+  # Maker exit target: round-trip cost at maker fees is ~60 bps, so the
+  # resting sell goes 90 bps above entry (= 70 bps fee hurdle + edge).
+  tp_pct: 0.009
+  # If the maker exit is not filled in this long, flatten with a taker
+  # order (paying the 0.35% fee) to avoid being trapped in a stale market.
+  exit_timeout_sec: 300.0
+  # Hard time stop; flatten taker.
+  max_holding_sec: 1800.0
+  # Crash guard: immediate taker exit (mirrors risk.stop_loss_pct).
+  stop_loss_pct: 0.01
+  # Notional per entry, fixed 1,000,000 IRT (matches the taker engine size).
+  size_quote_irt: 1000000.0
+  # Slippage applied to forced taker flattens (edge exits).
+  flatten_slippage: 0.0005
 
 paths:
   raw_dir: data/raw

@@ -31,6 +31,7 @@ from tradebot.data.orderbook import OrderBookState
 from tradebot.data.recorder import RawDataRecorder
 from tradebot.data.trades import TradesStream
 from tradebot.engine.exits import ExitRules
+from tradebot.engine.maker_engine import MakerEngine
 from tradebot.engine.paper_engine import ExitReason, PaperEngine
 from tradebot.engine.risk import RiskManager
 from tradebot.report.metrics import ReportWriter
@@ -76,6 +77,7 @@ class TradingBot:
         self._last_raw_score: float = 0.0
         self._edge: EdgeEstimator | None = None
         self._engine: PaperEngine | None = None
+        self._maker: MakerEngine | None = None
         self._risk = RiskManager(config.risk, config.position)
         self._report: ReportWriter | None = None
         self._ws: BitpinWsClient | None = None
@@ -204,6 +206,17 @@ class TradingBot:
         self._scorer = Scorer(cfg.scoring)
         self._edge = EdgeEstimator(cfg.edge, cfg.execution, commission)
         self._engine = PaperEngine(cfg.capital.initial_irt, cfg.execution, commission)
+        self._maker = (
+            MakerEngine(
+                cfg.maker,
+                cfg.exit,
+                commission.maker_fraction,
+                commission.taker_fraction,
+                cfg.paths.raw_dir,
+            )
+            if cfg.maker.enabled
+            else None
+        )
         # NOTE: self._risk is intentionally reused across (re)starts so the
         # daily-loss accumulator survives a Stop/Start within the same day.
         self._report = ReportWriter(cfg.paths.reports_dir, cfg.capital.initial_irt)
@@ -277,6 +290,16 @@ class TradingBot:
                             trade.pnl_irt,
                         )
                 mark = book.best_bid.price if book.best_bid else 0.0
+                maker = self._maker
+                if maker is not None:
+                    closed = maker.close_all(book, time.time(), reason="shutdown")
+                    if closed is not None:
+                        logger.info(
+                            "Maker: force-closed on stop: pnl=%.0f IRT (%.1f bps)",
+                            closed["pnl_irt"],
+                            closed["net_bps"],
+                        )
+                    self._dashboard_state.sync_maker(maker)
                 summary = report.write_summary(engine.account, mark_price=mark)
                 report.log_summary(summary)
                 logger.info("Reports written to %s", self._config.paths.reports_dir)
@@ -300,11 +323,15 @@ class TradingBot:
             self._dashboard_state.on_book(self._book_state.book, time.time())
         if self._features is not None and self._book_state.book.is_valid():
             self._features.on_book(self._book_state.book)
+        if self._maker is not None and self._book_state.book.is_valid():
+            self._maker.on_book(self._book_state.book, time.time())
 
     def _on_matches(self, payload: dict) -> None:
         self._trades.apply_matches(payload)
         self._recorder.record_matches(payload)
         self._dashboard_state.on_matches(payload)
+        if self._maker is not None:
+            self._maker.on_matches(payload, time.time())
 
     # ------------------------------------------------------------------
     # Durable setup (once per process)
@@ -391,6 +418,16 @@ class TradingBot:
             "fees": {
                 "maker": commission.maker_fraction,
                 "taker": commission.taker_fraction,
+            },
+            "maker": {
+                "enabled": cfg.maker.enabled,
+                "min_score": cfg.maker.min_score,
+                "tp_pct": cfg.maker.tp_pct,
+                "stop_loss_pct": cfg.maker.stop_loss_pct,
+                "entry_timeout_sec": cfg.maker.entry_timeout_sec,
+                "exit_timeout_sec": cfg.maker.exit_timeout_sec,
+                "max_holding_sec": cfg.maker.max_holding_sec,
+                "repeg_bps": cfg.maker.repeg_bps,
             },
         }
 
@@ -497,11 +534,27 @@ class TradingBot:
         persistent = features_engine.persistence.is_persistent()
         dominant = features_engine.persistence.dominant_sign()
 
+        if self._maker is not None:
+            self._maker.eval(
+                feats_valid=feats.valid,
+                score=score if score_result.valid else None,
+                persistent=persistent,
+                dominant=dominant,
+                book=book,
+                now=now,
+            )
+            self._dashboard_state.sync_maker(self._maker, book, now)
+
         if now - self._last_status_at >= 30.0:
             self._last_status_at = now
+            maker_state = (
+                self._maker.payload(book, now)["state"]
+                if self._maker is not None
+                else "off"
+            )
             logger.info(
                 "status %s mid=%.0f spread=%.0f bps book_age=%.1fs score=%+.3f "
-                "raw=%+.3f persistent=%s pos=%s equity=%.0f IRT",
+                "raw=%+.3f persistent=%s pos=%s maker=%s equity=%.0f IRT",
                 self._symbol,
                 feats.mid,
                 feats.spread_pct * 10000 if feats.valid else -1,
@@ -510,6 +563,7 @@ class TradingBot:
                 self._last_raw_score,
                 persistent,
                 engine.account.state.value,
+                maker_state,
                 engine.equity_irt(book),
             )
 
@@ -772,7 +826,13 @@ def _clean_previous_run(config: Config) -> None:
     stamp = time.strftime("%Y%m%d_%H%M%S")
     archived = 0
     if config.paths.raw_dir.is_dir():
-        for pattern in ("signals*.csv", "trades*.csv", "books*.jsonl", "matches*.jsonl"):
+        for pattern in (
+            "signals*.csv",
+            "trades*.csv",
+            "maker_trades*.csv",
+            "books*.jsonl",
+            "matches*.jsonl",
+        ):
             for path in sorted(config.paths.raw_dir.glob(pattern)):
                 if not path.is_file() or path.stat().st_size == 0:
                     continue

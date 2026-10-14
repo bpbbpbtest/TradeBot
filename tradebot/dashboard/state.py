@@ -32,6 +32,7 @@ class DashboardState:
         self._run_id = 0
         self._run_started_at = time.time()
         self._account: dict[str, Any] = {}
+        self._maker: dict[str, Any] = {"enabled": False}
         self._status: dict[str, Any] = {
             "running": False,
             "symbol": "",
@@ -66,6 +67,13 @@ class DashboardState:
         self._last_action = ""
         self._last_point_ts = 0.0
         self._known_trades = 0
+        self._maker = {"enabled": False}
+
+    def sync_maker(self, maker: Any, book: Any = None, now: float | None = None) -> None:
+        """Refresh the parallel paper-maker engine payload (eval cadence)."""
+        self._maker = (
+            maker.payload(book, now) if maker is not None else {"enabled": False}
+        )
 
     # ------------------------------------------------------------------
     # Feed methods (called from the bot's asyncio loop)
@@ -300,12 +308,17 @@ class DashboardState:
                 (take - bid) / bid * 10000 if bid and take else None
             )
             net_if_exit = None
+            est_fee_exit = None
+            u_pnl_net_pct = None
             if bid and account.base_holding > 0:
                 gross = account.base_holding * bid
+                est_fee_exit = gross * fee_taker
                 net_if_exit = round(
                     gross * (1 - fee_taker) - trade.quote_spent - trade.fee_entry,
                     2,
                 )
+                if trade.quote_spent > 0:
+                    u_pnl_net_pct = net_if_exit / trade.quote_spent * 100
             payload.update(
                 {
                     "entry": entry,
@@ -313,8 +326,12 @@ class DashboardState:
                     "qty": account.base_holding,
                     "quote_spent": round(trade.quote_spent, 2),
                     "fee_entry": round(trade.fee_entry, 2),
+                    "est_fee_exit": round(est_fee_exit, 2) if est_fee_exit is not None else None,
+                    "est_fees_total": round(trade.fee_entry + est_fee_exit, 2) if est_fee_exit is not None else round(trade.fee_entry, 2),
                     "u_pnl": round(u_pnl, 2),
                     "u_pnl_pct": round(u_pnl_pct, 4) if u_pnl_pct is not None else None,
+                    "u_pnl_net": net_if_exit,
+                    "u_pnl_net_pct": round(u_pnl_net_pct, 4) if u_pnl_net_pct is not None else None,
                     "stop": stop,
                     "take": take,
                     "dist_stop_bps": round(dist_stop_bps, 1) if dist_stop_bps is not None else None,
@@ -383,9 +400,10 @@ class DashboardState:
             "exit_ts": None,
             "exit_price": None,
             "qty": pos.get("qty"),
-            "fees_total": pos.get("fee_entry"),
-            "pnl": pos.get("u_pnl"),
-            "pnl_pct": pos.get("u_pnl_pct"),
+            "fees_total": pos.get("est_fees_total", pos.get("fee_entry")),
+            "pnl": pos.get("u_pnl_net", pos.get("u_pnl")),
+            "pnl_pct": pos.get("u_pnl_net_pct", pos.get("u_pnl_pct")),
+            "u_pnl": pos.get("u_pnl"),
             "holding_sec": pos.get("holding_sec"),
             "reason": "OPEN",
             "net_if_exit": pos.get("net_if_exit"),
@@ -410,6 +428,7 @@ class DashboardState:
             "features": self._features,
             "position": self._position,
             "account": self._account,
+            "maker": self._maker,
             "halt": self._halt,
             "action": self._last_action,
             "recent_actions": list(self._actions)[-60:][::-1],

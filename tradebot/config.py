@@ -73,6 +73,10 @@ class ExecutionConfig:
 class PositionConfig:
     max_position_fraction: float
     max_touch_depth_fraction: float
+    # Absolute per-trade notional cap (IRT). When > 0 it replaces the
+    # equity-fraction strategy cap so trade size stays fixed regardless of
+    # equity drift. Cash and touch-depth limits still apply.
+    max_notional_irt: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -95,6 +99,29 @@ class ExitConfig:
     max_holding_sec: float
     min_hold_sec: float = 60.0
     score_exit_windows: int = 3
+
+
+@dataclass(frozen=True)
+class MakerConfig:
+    """Virtual resting-limit (maker) execution, run in parallel to taker.
+
+    Fills are simulated from public book/matches data; no real orders.
+    Defaults assume Bitpin level-1 fees (maker 0.30% / taker 0.35%) and the
+    fee-hurdle take-profit (>=70 bps round trip plus edge).
+    """
+
+    enabled: bool = True
+    min_score: float = 0.15
+    join_offset_bps: float = 0.0
+    # Re-peg the resting order when the touch moves further than this.
+    repeg_bps: float = 5.0
+    entry_timeout_sec: float = 60.0
+    tp_pct: float = 0.009
+    exit_timeout_sec: float = 300.0
+    max_holding_sec: float = 1800.0
+    stop_loss_pct: float = 0.01
+    size_quote_irt: float = 950000.0
+    flatten_slippage: float = 0.0005
 
 
 @dataclass(frozen=True)
@@ -129,6 +156,7 @@ class Config:
     position: PositionConfig
     risk: RiskConfig
     exit: ExitConfig
+    maker: MakerConfig
     paths: PathsConfig
     logging: LoggingConfig
     dashboard: DashboardConfig
@@ -188,6 +216,12 @@ def load_config(config_path: str | Path = "config.yaml") -> Config:
     elif not isinstance(dashboard_raw, dict):
         raise ValueError("Missing or invalid config section: dashboard")
 
+    maker_raw = raw.get("maker")
+    if maker_raw is None:
+        maker_raw = {}
+    elif not isinstance(maker_raw, dict):
+        raise ValueError("Missing or invalid config section: maker")
+
     return Config(
         market=_build(MarketConfig, _section(raw, "market"), "market"),
         capital=_build(CapitalConfig, _section(raw, "capital"), "capital"),
@@ -204,6 +238,7 @@ def load_config(config_path: str | Path = "config.yaml") -> Config:
         position=_build(PositionConfig, _section(raw, "position"), "position"),
         risk=_build(RiskConfig, _section(raw, "risk"), "risk"),
         exit=_build(ExitConfig, _section(raw, "exit"), "exit"),
+        maker=_build(MakerConfig, maker_raw, "maker"),
         paths=PathsConfig(raw_dir=raw_dir, reports_dir=reports_dir),
         logging=_build(LoggingConfig, _section(raw, "logging"), "logging"),
         dashboard=_build(DashboardConfig, dashboard_raw, "dashboard"),

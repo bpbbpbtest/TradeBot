@@ -214,7 +214,7 @@
         <div><div class="k">Equity</div><div class="v" id="a-equity">—</div></div>
         <div><div class="k">ROI</div><div class="v" id="a-roi">—</div></div>
         <div><div class="k">Realized PnL</div><div class="v" id="a-realized">—</div></div>
-        <div><div class="k">Unrealized PnL</div><div class="v" id="a-unrealized">—</div></div>
+        <div><div class="k">Unrealized (gross)</div><div class="v" id="a-unrealized">—</div></div>
         <div><div class="k">Fees paid</div><div class="v" id="a-fees">—</div></div>
         <div><div class="k">Cash</div><div class="v" id="a-cash">—</div></div>
         <div><div class="k">Trades (W/L)</div><div class="v" id="a-trades">—</div></div>
@@ -227,8 +227,8 @@
       <h3>Open position</h3>
       <div class="pos-grid">
         <div><div class="k">State</div><div class="v" id="p-state">—</div></div>
-        <div><div class="k">Unrealized PnL</div><div class="v" id="p-upnl">—</div></div>
-        <div><div class="k">uPnL %</div><div class="v" id="p-upnl-pct">—</div></div>
+        <div><div class="k">Unrealized (gross)</div><div class="v" id="p-upnl">—</div></div>
+        <div><div class="k">uPnL % (gross)</div><div class="v" id="p-upnl-pct">—</div></div>
         <div><div class="k">Net if exited now</div><div class="v" id="p-net-exit">—</div></div>
         <div><div class="k">Entry</div><div class="v" id="p-entry">—</div></div>
         <div><div class="k">Qty (base)</div><div class="v" id="p-qty">—</div></div>
@@ -240,6 +240,25 @@
         <div><div class="k">Distance to TP</div><div class="v" id="p-dist-take">—</div></div>
         <div><div class="k">Score @ entry</div><div class="v" id="p-score-entry">—</div></div>
         <div><div class="k">Holding</div><div class="v" id="p-hold">—</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Paper maker engine <span id="m-state" class="badge pos-flat">OFF</span></h3>
+      <div class="pos-grid">
+        <div><div class="k">Working order</div><div class="v" id="m-working">—</div></div>
+        <div><div class="k">Resting age</div><div class="v" id="m-working-age">—</div></div>
+        <div><div class="k">Position entry</div><div class="v" id="m-entry">—</div></div>
+        <div><div class="k">uPnL gross / net</div><div class="v" id="m-upnl">—</div></div>
+        <div><div class="k">Target (maker)</div><div class="v buy" id="m-target">—</div></div>
+        <div><div class="k">Distance to target</div><div class="v" id="m-dist-target">—</div></div>
+        <div><div class="k">Holding</div><div class="v" id="m-hold">—</div></div>
+        <div><div class="k">Trades (W)</div><div class="v" id="m-stats">—</div></div>
+        <div><div class="k">Realized / Fees</div><div class="v" id="m-realized">—</div></div>
+        <div><div class="k">Avg net bps</div><div class="v" id="m-avg-bps">—</div></div>
+      </div>
+      <div class="scroll" style="margin-top:8px">
+        <table><thead><tr><th>Entry</th><th>Exit</th><th>Kind</th><th>PnL</th><th>bps</th></tr></thead>
+        <tbody id="maker-trades-body"><tr><td colspan="5" style="color:var(--muted)">no maker trades yet…</td></tr></tbody></table>
       </div>
     </div>
     <div class="panel">
@@ -446,7 +465,7 @@
       const hold = t.holding_sec == null ? "—" : fmtDur(t.holding_sec);
       const reason = t.live ? `<span class="live-dot"></span>OPEN` : esc(t.reason);
       const tip = t.live
-        ? `OPEN · net if exit now: ${fmt(t.net_if_exit)} IRT · to stop ${fmt(t.dist_stop_bps, 1)} bps · to TP ${fmt(t.dist_take_bps, 1)} bps`
+        ? `OPEN · PnL column = net after fees · gross ${fmt(t.u_pnl)} IRT · net if exit now: ${fmt(t.net_if_exit)} IRT · to stop ${fmt(t.dist_stop_bps, 1)} bps · to TP ${fmt(t.dist_take_bps, 1)} bps`
         : esc(t.id);
       return `<tr class="${t.live ? "trade-open" : ""}" title="${tip}">
         <td>${fmtTs(t.entry_ts)}<br><b>${fmt(t.entry_price)}</b></td>
@@ -459,6 +478,51 @@
         <td>${reason}</td>
       </tr>`;
     }).join("") || `<tr><td colspan="8" style="color:var(--muted)">none yet</td></tr>`;
+  }
+
+  function renderMaker(m) {
+    const enabled = m && m.enabled;
+    const badge = $("m-state");
+    if (!enabled) {
+      badge.textContent = "OFF";
+      badge.className = "badge pos-flat";
+      ["m-working", "m-working-age", "m-entry", "m-upnl", "m-target", "m-dist-target", "m-hold"]
+        .forEach(id => { $(id).textContent = "—"; });
+      $("m-stats").textContent = "—";
+      $("m-realized").textContent = "—";
+      $("m-avg-bps").textContent = "—";
+      $("maker-trades-body").innerHTML =
+        `<tr><td colspan="5" style="color:var(--muted)">engine off</td></tr>`;
+      return;
+    }
+    badge.textContent = (m.state || "flat").toUpperCase();
+    badge.className = "badge " +
+      (m.state === "long" ? "pos-long" : m.state === "entry_working" ? "action-entry" : "pos-flat");
+    const w = m.working;
+    $("m-working").textContent = w ? `${w.side} ${fmt(w.price)} × ${fmt(w.qty, 3)}` : "—";
+    $("m-working-age").textContent = w ? `${fmtDur(w.age_sec)} · re-pegs ${w.repeg_count}` : "—";
+    const p = m.position;
+    $("m-entry").textContent = p ? `${fmt(p.entry_price)} × ${fmt(p.qty, 3)}` : "—";
+    $("m-upnl").textContent = p ? `${fmt(p.u_gross)} / ${fmt(p.u_net)} IRT` : "—";
+    $("m-target").textContent = p ? fmt(p.exit_price) : "—";
+    $("m-dist-target").textContent =
+      p && p.dist_target_bps != null ? fmt(p.dist_target_bps, 1) + " bps" : "—";
+    $("m-hold").textContent = p ? fmtDur(p.holding_sec) : "—";
+    const st = m.stats || {};
+    $("m-stats").textContent = `${st.trades || 0} (${st.wins || 0})`;
+    $("m-realized").textContent = `${fmt(st.realized_irt)} / ${fmt(st.fees_irt)} IRT`;
+    $("m-avg-bps").textContent =
+      st.avg_net_bps == null ? "—" : fmt(st.avg_net_bps, 1) + " bps";
+    const rows = m.last_trades || [];
+    $("maker-trades-body").innerHTML = rows.map(t =>
+      `<tr title="entry ${fmtTs(t.entry_ts)} → exit ${fmtTs(t.exit_ts)} · fees ${fmt((+t.fee_entry || 0) + (+t.fee_exit || 0))}">
+        <td>${fmtTs(t.entry_ts)}<br><b>${fmt(t.entry_price)}</b></td>
+        <td>${fmtTs(t.exit_ts)}<br><b>${fmt(t.exit_price)}</b></td>
+        <td>${esc(t.exit_kind)}</td>
+        <td style="text-align:right" class="${pnlClass(t.pnl_irt)}">${fmt(t.pnl_irt)}</td>
+        <td style="text-align:right" class="${pnlClass(t.net_bps)}">${fmt(t.net_bps, 1)}</td>
+      </tr>`
+    ).join("") || `<tr><td colspan="5" style="color:var(--muted)">no maker trades yet…</td></tr>`;
   }
 
   function renderParams(pr) {
@@ -552,6 +616,7 @@
     renderActions(st.recent_actions || []);
     renderMatches(st.matches || []);
     renderTrades(st.trades || []);
+    renderMaker(st.maker || {});
     setMarkers(st.markers || []);
     addPoint(st.point);
   }

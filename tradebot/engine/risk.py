@@ -124,8 +124,12 @@ class RiskManager:
         # 1) Cash actually available right now.
         q_cash = cash_irt
 
-        # 2) Strategy cap on exposure relative to current equity.
-        q_cap = equity_irt * self._position.max_position_fraction
+        # 2) Strategy cap: fixed per-trade notional when configured,
+        # otherwise the legacy equity-fraction cap.
+        if self._position.max_notional_irt > 0:
+            q_cap = self._position.max_notional_irt
+        else:
+            q_cap = equity_irt * self._position.max_position_fraction
 
         # 3) Immediately tradeable depth at the touch (asks for a buy).
         touch_notional = ask.price * ask.volume
