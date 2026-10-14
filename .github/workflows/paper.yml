@@ -86,7 +86,7 @@ jobs:
           TEH_DATE=$(TZ=Asia/Tehran date +%Y-%m-%d)
           TEH_TIME=$(TZ=Asia/Tehran date +%H:%M)
           SLOT=$(TZ=Asia/Tehran date +%H%M)
-          RUN_DIR="runs/${TEH_DATE}_${SLOT}"
+          RUN_DIR="data/runs/${TEH_DATE}_${SLOT}"
           mkdir -p "$RUN_DIR"
 
           # Raw recordings (signals/trades CSVs, books/matches streams)
