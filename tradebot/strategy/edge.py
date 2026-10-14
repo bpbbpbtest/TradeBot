@@ -38,12 +38,19 @@ class EdgeEstimator:
         fee_entry = self._commission.taker_fraction
         fee_exit = self._commission.taker_fraction
         spread_cost = features.spread_pct
-        slippage = self._execution.edge_exit_slippage
-        round_trip_cost = fee_entry + fee_exit + spread_cost + slippage
+        # Worst-case buffers: entries may slip up to max_slippage, exits are
+        # priced with the dedicated edge buffer (both legs are marketable).
+        entry_slip = self._execution.max_slippage
+        exit_slip = self._execution.edge_exit_slippage
+        round_trip_cost = (
+            fee_entry + fee_exit + spread_cost + entry_slip + exit_slip
+        )
 
         expected_move = self._edge.expected_move_coef * score
-        net_edge = abs(expected_move) - round_trip_cost
-        passes = net_edge >= self._edge.required_edge and expected_move > 0
+        # Long-only: a negative score predicts a down move (a loss for the
+        # position), so net_edge must stay signed — no abs().
+        net_edge = expected_move - round_trip_cost
+        passes = net_edge >= self._edge.required_edge
         if not self._edge.enforce:
             # Calibration mode: log the edge but do not block entries.
             passes = expected_move > 0

@@ -293,8 +293,10 @@
     scoreChart.applyOptions({ width: s.clientWidth, height: 110 });
   }).observe($("price-chart").parentElement);
 
-  let lastChartTime = 0, lastPointTs = 0, markersKey = "", paramsKey = "";
+  let lastChartTime = 0, lastPointTs = 0, markersKey = "", paramsKey = "", lastRunId = -1;
   const chartTimeByTs = new Map();  // floor(original ts) -> chart time (toChartTime may bump)
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   function toChartTime(ts) {
     let t = Math.floor(ts);
@@ -426,14 +428,14 @@
   function renderActions(actions) {
     const tbody = $("actions-body");
     tbody.innerHTML = actions.map(a =>
-      `<tr><td>${fmtTs(a.ts)}</td><td>${fmt(a.score, 3)}</td><td>${fmt(a.mid)}</td><td class="${actionClass(a.action)}">${a.action}</td></tr>`
+      `<tr><td>${fmtTs(a.ts)}</td><td>${fmt(a.score, 3)}</td><td>${fmt(a.mid)}</td><td class="${actionClass(a.action)}">${esc(a.action)}</td></tr>`
     ).join("") || `<tr><td colspan="4" style="color:var(--muted)">waiting…</td></tr>`;
   }
 
   function renderMatches(matches) {
     const tbody = $("matches-body");
     tbody.innerHTML = matches.map(m =>
-      `<tr><td>${fmtTs(m.ts)}</td><td>${fmt(m.price)}</td><td style="text-align:right">${fmt(m.amount, 4)}</td><td style="text-align:right" class="match-${m.side}">${m.side}</td></tr>`
+      `<tr><td>${fmtTs(m.ts)}</td><td>${fmt(m.price)}</td><td style="text-align:right">${fmt(m.amount, 4)}</td><td style="text-align:right" class="match-${esc(m.side)}">${esc(m.side)}</td></tr>`
     ).join("") || `<tr><td colspan="4" style="color:var(--muted)">no trades yet…</td></tr>`;
   }
 
@@ -442,10 +444,10 @@
     tbody.innerHTML = trades.map(t => {
       const cls = pnlClass(t.pnl);
       const hold = t.holding_sec == null ? "—" : fmtDur(t.holding_sec);
-      const reason = t.live ? `<span class="live-dot"></span>OPEN` : t.reason;
+      const reason = t.live ? `<span class="live-dot"></span>OPEN` : esc(t.reason);
       const tip = t.live
         ? `OPEN · net if exit now: ${fmt(t.net_if_exit)} IRT · to stop ${fmt(t.dist_stop_bps, 1)} bps · to TP ${fmt(t.dist_take_bps, 1)} bps`
-        : t.id;
+        : esc(t.id);
       return `<tr class="${t.live ? "trade-open" : ""}" title="${tip}">
         <td>${fmtTs(t.entry_ts)}<br><b>${fmt(t.entry_price)}</b></td>
         <td>${t.live ? "—" : fmtTs(t.exit_ts) + "<br><b>" + fmt(t.exit_price) + "</b>"}</td>
@@ -503,6 +505,14 @@
 
   // ---- main render ----
   function render(st) {
+    if (st.run_id != null) {
+      if (lastRunId !== -1 && st.run_id !== lastRunId) {
+        // Server restarted (new run / symbol switch): drop old-symbol data.
+        priceSeries.setData([]); scoreSeries.setData([]);
+        chartTimeByTs.clear(); markersKey = ""; lastPointTs = 0; lastChartTime = 0;
+      }
+      lastRunId = st.run_id;
+    }
     if (st.params) { $("sym").textContent = st.params.symbol || "—"; renderParams(st.params); }
     const b = st.book || {};
     $("h-mid").textContent = fmt(b.mid);
@@ -563,7 +573,7 @@
     $("btn-start").disabled = ctlBusy || runStatus.running;
     $("btn-stop").disabled = ctlBusy || !runStatus.running;
     $("sym-select").disabled = ctlBusy || runStatus.running;
-    if (runStatus.error) $("ctl-error").textContent = runStatus.error;
+    $("ctl-error").textContent = runStatus.error || "";
   }
 
   async function loadSymbols() {
@@ -572,7 +582,7 @@
       const sel = $("sym-select");
       const wanted = runStatus.symbol || sel.value;
       sel.innerHTML = (d.symbols || [])
-        .map(s => `<option value="${s}">${s}</option>`)
+        .map(s => `<option value="${esc(s)}">${esc(s)}</option>`)
         .join("");
       if (wanted && [...sel.options].some(o => o.value === wanted)) {
         sel.value = wanted;
@@ -589,16 +599,18 @@
         method,
         headers: { "Content-Type": "application/json" },
         body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(35000),
       });
       const d = await res.json();
       if (d.ok === false) $("ctl-error").textContent = d.error || "request failed";
       if (d.status) applyStatus(d.status);
     } catch (e) {
       $("ctl-error").textContent = String(e);
+    } finally {
+      ctlBusy = false;
+      updateCtl();
+      await loadSymbols();
     }
-    ctlBusy = false;
-    updateCtl();
-    await loadSymbols();
   }
 
   $("btn-start").addEventListener("click", () => {

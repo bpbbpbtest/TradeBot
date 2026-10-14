@@ -34,10 +34,14 @@ class RiskManager:
         self.halted: bool = False
         self.halt_reason: str = ""
 
-    @staticmethod
-    def _day_start() -> float:
+    # Tehran is UTC+3:30 year-round (DST was abolished in 2022), so the
+    # local day starts at 20:30 UTC of the previous calendar day.
+    _TEHRAN_OFFSET_SEC = 3.5 * 3600
+
+    @classmethod
+    def _day_start(cls) -> float:
         now = time.time()
-        return now - (now % 86400)
+        return now - ((now + cls._TEHRAN_OFFSET_SEC) % 86400)
 
     def _roll_day(self, now: float) -> None:
         if now - self._daily_anchor >= 86400:

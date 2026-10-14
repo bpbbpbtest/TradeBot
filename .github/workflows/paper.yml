@@ -12,6 +12,9 @@ on:
         required: false
         default: "30"
 
+permissions:
+  contents: read
+
 jobs:
   paper:
     runs-on: ubuntu-latest
@@ -21,7 +24,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: pip
 
       - name: Install dependencies
@@ -43,8 +46,9 @@ jobs:
           echo "::notice title=Runner IP for Bitpin whitelist::${IP}"
 
       - name: Wait for manual IP whitelist
+        env:
+          WAIT: ${{ github.event.inputs.wait_sec || '30' }}
         run: |
-          WAIT=${{ github.event.inputs.wait_sec || '30' }}
           echo "Waiting ${WAIT}s so the IP can be added on Bitpin..."
           sleep "${WAIT}"
 
@@ -52,8 +56,16 @@ jobs:
         env:
           BITPIN_API_KEY: ${{ secrets.BITPIN_API_KEY }}
           BITPIN_SECRET_KEY: ${{ secrets.BITPIN_SECRET_KEY }}
+          DURATION: ${{ github.event.inputs.duration_sec || '3600' }}
         run: |
-          python -m tradebot.main --duration "${{ github.event.inputs.duration_sec || '3600' }}"
+          python -m tradebot.main --duration "$DURATION"
+
+      - name: Verify the bot produced a summary
+        run: |
+          if [ ! -f data/reports/summary.json ]; then
+            echo "::error::summary.json missing — the bot never completed a run"
+            exit 1
+          fi
 
       - name: Upload data and reports
         if: always()

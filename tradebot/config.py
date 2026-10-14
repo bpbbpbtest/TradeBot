@@ -57,7 +57,9 @@ class EdgeConfig:
     required_edge: float
     default_fee_taker: float
     default_fee_maker: float
-    enforce: bool = True
+    # Safe default is calibration mode: an omitted key must never silently
+    # switch on a gate that (with today's costs) blocks every entry.
+    enforce: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,14 @@ def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+def _build(dc_type: type, section: dict[str, Any], name: str) -> Any:
+    """Instantiate a config dataclass, reporting bad keys clearly."""
+    try:
+        return dc_type(**section)
+    except TypeError as exc:
+        raise ValueError(f"Invalid config section '{name}': {exc}") from exc
+
+
 def load_config(config_path: str | Path = "config.yaml") -> Config:
     """Load YAML config plus API credentials from the environment (.env)."""
     load_dotenv()
@@ -152,35 +162,49 @@ def load_config(config_path: str | Path = "config.yaml") -> Config:
     if not isinstance(raw, dict):
         raise ValueError("Config root must be a mapping")
 
+    # Paper trading works without auth (public market data only); the bot
+    # logs a warning and falls back to configured default fees.
     api_key = os.environ.get("BITPIN_API_KEY", "")
     secret_key = os.environ.get("BITPIN_SECRET_KEY", "")
-    if not api_key or not secret_key:
-        # Paper trading works without auth (public market data only); the
-        # bot logs a warning and falls back to configured default fees.
-        api_key = api_key or ""
-        secret_key = secret_key or ""
 
     paths = _section(raw, "paths")
+    try:
+        raw_dir = Path(paths["raw_dir"])
+        reports_dir = Path(paths["reports_dir"])
+    except KeyError as exc:
+        raise ValueError(f"Missing key in config section 'paths': {exc}") from exc
+    # Resolve data paths against the config file's directory so running the
+    # bot from another working directory cannot record elsewhere or wipe an
+    # unrelated ./data/raw (see main._clean_previous_run).
+    base_dir = path.resolve().parent
+    if not raw_dir.is_absolute():
+        raw_dir = base_dir / raw_dir
+    if not reports_dir.is_absolute():
+        reports_dir = base_dir / reports_dir
+
+    dashboard_raw = raw.get("dashboard")
+    if dashboard_raw is None:
+        dashboard_raw = {}
+    elif not isinstance(dashboard_raw, dict):
+        raise ValueError("Missing or invalid config section: dashboard")
+
     return Config(
-        market=MarketConfig(**_section(raw, "market")),
-        capital=CapitalConfig(**_section(raw, "capital")),
-        api=ApiConfig(
-            **_section(raw, "api"),
-            api_key=api_key,
-            secret_key=secret_key,
+        market=_build(MarketConfig, _section(raw, "market"), "market"),
+        capital=_build(CapitalConfig, _section(raw, "capital"), "capital"),
+        api=_build(
+            ApiConfig,
+            {**_section(raw, "api"), "api_key": api_key, "secret_key": secret_key},
+            "api",
         ),
-        features=FeatureConfig(**_section(raw, "features")),
-        scoring=ScoringConfig(**_section(raw, "scoring")),
-        entry=EntryConfig(**_section(raw, "entry")),
-        edge=EdgeConfig(**_section(raw, "edge")),
-        execution=ExecutionConfig(**_section(raw, "execution")),
-        position=PositionConfig(**_section(raw, "position")),
-        risk=RiskConfig(**_section(raw, "risk")),
-        exit=ExitConfig(**_section(raw, "exit")),
-        paths=PathsConfig(
-            raw_dir=Path(paths["raw_dir"]),
-            reports_dir=Path(paths["reports_dir"]),
-        ),
-        logging=LoggingConfig(**_section(raw, "logging")),
-        dashboard=DashboardConfig(**(raw.get("dashboard") or {})),
+        features=_build(FeatureConfig, _section(raw, "features"), "features"),
+        scoring=_build(ScoringConfig, _section(raw, "scoring"), "scoring"),
+        entry=_build(EntryConfig, _section(raw, "entry"), "entry"),
+        edge=_build(EdgeConfig, _section(raw, "edge"), "edge"),
+        execution=_build(ExecutionConfig, _section(raw, "execution"), "execution"),
+        position=_build(PositionConfig, _section(raw, "position"), "position"),
+        risk=_build(RiskConfig, _section(raw, "risk"), "risk"),
+        exit=_build(ExitConfig, _section(raw, "exit"), "exit"),
+        paths=PathsConfig(raw_dir=raw_dir, reports_dir=reports_dir),
+        logging=_build(LoggingConfig, _section(raw, "logging"), "logging"),
+        dashboard=_build(DashboardConfig, dashboard_raw, "dashboard"),
     )

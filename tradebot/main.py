@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gzip
 import logging
+import os
+import shutil
 import signal
 import time
 from pathlib import Path
@@ -38,6 +41,7 @@ from tradebot.strategy.scoring import Scorer
 logger = logging.getLogger("tradebot")
 
 _SYMBOLS_CACHE_SEC = 120.0
+_INSTANCE_LOCK: Any = None
 
 
 class TradingBot:
@@ -53,6 +57,9 @@ class TradingBot:
         )
         self._dashboard: DashboardServer | None = None
         self._stop_event = asyncio.Event()
+        # Serializes start/stop so concurrent dashboard requests (or a stop
+        # arriving mid-start) cannot orphan WS clients or leak eval loops.
+        self._ctl_lock = asyncio.Lock()
         self._eval_interval: float = max(
             0.5,
             config.features.persistence_window_sec
@@ -114,18 +121,35 @@ class TradingBot:
 
     async def start_trading(self, symbol: str | None = None) -> dict[str, Any]:
         """(Re)start the trading loop on ``symbol`` (default: current)."""
-        if self._trading:
-            raise RuntimeError(
-                "Trading is already running — stop it before starting again"
-            )
-        try:
-            status = await self._start_trading_impl(symbol)
-        except Exception as exc:  # noqa: BLE001
-            self._status_error = str(exc)
-            self._dashboard_state.set_status(False, self._symbol, str(exc))
-            raise
-        self._status_error = ""
-        return status
+        async with self._ctl_lock:
+            if self._trading:
+                raise RuntimeError(
+                    "Trading is already running — stop it before starting again"
+                )
+            try:
+                status = await self._start_trading_impl(symbol)
+            except Exception as exc:  # noqa: BLE001
+                self._status_error = str(exc)
+                self._dashboard_state.set_status(False, self._symbol, str(exc))
+                await self._cleanup_failed_start()
+                raise
+            self._status_error = ""
+            return status
+
+    async def _cleanup_failed_start(self) -> None:
+        """Tear down anything a partially-completed start left behind."""
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                await ws.stop()
+            except Exception:  # noqa: BLE001
+                logger.debug("WS cleanup after failed start", exc_info=True)
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+        self._trading = False
 
     async def _start_trading_impl(self, symbol: str | None) -> dict[str, Any]:
         target = (symbol or self._symbol).upper().strip()
@@ -176,11 +200,12 @@ class TradingBot:
         )
 
         self._trades = TradesStream(window_sec=cfg.features.ofi_z_window_sec)
-        self._features = FeatureEngine(cfg.features, self._trades)
+        self._features = FeatureEngine(cfg.features)
         self._scorer = Scorer(cfg.scoring)
         self._edge = EdgeEstimator(cfg.edge, cfg.execution, commission)
         self._engine = PaperEngine(cfg.capital.initial_irt, cfg.execution, commission)
-        self._risk = RiskManager(cfg.risk, cfg.position)
+        # NOTE: self._risk is intentionally reused across (re)starts so the
+        # daily-loss accumulator survives a Stop/Start within the same day.
         self._report = ReportWriter(cfg.paths.reports_dir, cfg.capital.initial_irt)
         self._ws = BitpinWsClient(
             cfg.api.ws_url,
@@ -188,7 +213,12 @@ class TradingBot:
             on_book=self._on_book,
             on_matches=self._on_matches,
         )
-        await self._ws.start()
+        try:
+            await self._ws.start()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"WebSocket failed to become ready for {target}: {exc}"
+            ) from exc
 
         self._recorder.archive_signals()
         self._dashboard_state.reset_run_data()
@@ -213,47 +243,51 @@ class TradingBot:
 
     async def stop_trading(self, reason: str = "manual") -> dict[str, Any]:
         """Stop the trading loop; force-close any open paper position."""
-        if not self._trading:
+        async with self._ctl_lock:
+            if not self._trading:
+                return self.status()
+            logger.info("Stopping trading (%s) ...", reason)
+
+            for task in self._tasks:
+                task.cancel()
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks = []
+
+            if self._ws is not None:
+                try:
+                    await self._ws.stop()
+                except Exception:  # noqa: BLE001
+                    logger.debug("WS stop failed during stop_trading", exc_info=True)
+                self._ws = None
+
+            engine = self._engine
+            report = self._report
+            if engine is not None and report is not None:
+                book = self._book_state.book
+                trade = None
+                if engine.account.state.value == "long" and book.is_valid():
+                    trade = engine.try_exit_long(book, ExitReason.SHUTDOWN)
+                    if trade is not None:
+                        self._risk.register_realized_pnl(
+                            trade.pnl_irt, time.time()
+                        )
+                        report.record_closed_trade(trade, engine.account)
+                        logger.info(
+                            "Force-closed open position on stop: pnl=%.0f IRT",
+                            trade.pnl_irt,
+                        )
+                mark = book.best_bid.price if book.best_bid else 0.0
+                summary = report.write_summary(engine.account, mark_price=mark)
+                report.log_summary(summary)
+                logger.info("Reports written to %s", self._config.paths.reports_dir)
+                # Final dashboard sync so a force-closed position does not
+                # linger as a live OPEN row after trading has stopped.
+                self._dashboard_state.sync_engine(engine, book, time.time())
+
+            self._trading = False
+            self._status_error = ""
+            self._dashboard_state.set_status(False, self._symbol, "")
             return self.status()
-        logger.info("Stopping trading (%s) ...", reason)
-
-        for task in self._tasks:
-            task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks = []
-
-        if self._ws is not None:
-            try:
-                await self._ws.stop()
-            except Exception:  # noqa: BLE001
-                logger.debug("WS stop failed during stop_trading", exc_info=True)
-            self._ws = None
-
-        engine = self._engine
-        report = self._report
-        if engine is not None and report is not None:
-            book = self._book_state.book
-            trade = None
-            if engine.account.state.value == "long" and book.is_valid():
-                trade = engine.try_exit_long(book, ExitReason.SHUTDOWN)
-                if trade is not None:
-                    self._risk.register_realized_pnl(
-                        trade.pnl_irt, time.time()
-                    )
-                    report.record_closed_trade(trade, engine.account)
-                    logger.info(
-                        "Force-closed open position on stop: pnl=%.0f IRT",
-                        trade.pnl_irt,
-                    )
-            mark = book.best_bid.price if book.best_bid else 0.0
-            summary = report.write_summary(engine.account, mark_price=mark)
-            report.log_summary(summary)
-            logger.info("Reports written to %s", self._config.paths.reports_dir)
-
-        self._trading = False
-        self._status_error = ""
-        self._dashboard_state.set_status(False, self._symbol, "")
-        return self.status()
 
     # ------------------------------------------------------------------
     # WebSocket callbacks (per-run; bound to the current WS client)
@@ -369,8 +403,12 @@ class TradingBot:
 
         The orderbook WS channel only pushes on change, so during quiet
         markets this resync is also what keeps the staleness gate satisfied.
+        Every 4th cycle also re-checks the market's suspended flag: without
+        it the bot would keep trading on a frozen book after e.g. USDT_IRT
+        closes for the night (the REST resync refreshes book freshness).
         """
         interval = self._config.api.resync_interval_sec
+        cycles = 0
         while self._trading:
             await asyncio.sleep(interval)
             try:
@@ -379,6 +417,33 @@ class TradingBot:
                 logger.debug("Order book resynced from REST")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("REST resync failed: %s", exc)
+
+            cycles += 1
+            if cycles % 4 == 0 and await self._market_not_tradable():
+                logger.warning(
+                    "Market %s is suspended/not tradable; stopping trading",
+                    self._symbol,
+                )
+                # Stop from a separate task: stop_trading cancels this loop,
+                # and awaiting it from inside itself would deadlock.
+                asyncio.ensure_future(self._stop_for_suspension())
+                return
+
+    async def _market_not_tradable(self) -> bool:
+        try:
+            info = await self._rest.get_market_info(self._symbol)
+            return info.suspended or not info.tradable
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Suspension check failed: %s", exc)
+            return False
+
+    async def _stop_for_suspension(self) -> None:
+        try:
+            await self.stop_trading("market_suspended")
+        finally:
+            msg = "Market suspended (e.g. USDT_IRT closes 21:00-09:00 Tehran)"
+            self._status_error = msg
+            self._dashboard_state.set_status(False, self._symbol, msg)
 
     async def _eval_loop(self) -> None:
         """Core decision loop, driven by wall clock, not by message rate."""
@@ -416,6 +481,11 @@ class TradingBot:
         if not self._risk.book_is_tradable(book, now):
             self._record_signal_raw(now, action="skip:book_not_tradable")
             return
+
+        # Sample equity every cycle so max drawdown captures unrealized
+        # swings inside open positions, not just trade-close snapshots.
+        if book.is_valid():
+            report.on_mark(engine.equity_irt(book))
 
         # --- Features + score ---
         feats = features_engine.compute(book, now)
@@ -506,7 +576,7 @@ class TradingBot:
             )
             self._record_signal(
                 feats, score, edge_estimator, now, "edge_blocked",
-                persistent, dominant,
+                persistent, dominant, edge=edge,
             )
             return
 
@@ -519,6 +589,7 @@ class TradingBot:
             self._record_signal(
                 feats, score, edge_estimator, now,
                 f"sizing:{sizing.limiting_factor}", persistent, dominant,
+                edge=edge,
             )
             return
 
@@ -526,7 +597,7 @@ class TradingBot:
         self._record_signal(
             feats, score, edge_estimator, now,
             "entered" if trade is not None else "entry_rejected",
-            persistent, dominant,
+            persistent, dominant, edge=edge,
         )
 
     def _record_signal(
@@ -538,8 +609,10 @@ class TradingBot:
         action: str,
         persistent: bool,
         dominant: int,
+        edge: Any = "auto",
     ) -> None:
-        edge = edge_estimator.estimate(feats, score) if feats.valid else None
+        if edge == "auto":
+            edge = edge_estimator.estimate(feats, score) if feats.valid else None
         self._recorder.record_signal(
             {
                 "ts": now,
@@ -651,13 +724,77 @@ class TradingBot:
         self._stop_event.set()
 
 
+def _acquire_instance_lock(config: Config) -> None:
+    """Hold an exclusive OS lock so only one bot instance can run.
+
+    A second instance used to wipe the first one's data files and fight
+    over the dashboard port. The lock lives in data/.instance.lock and is
+    released automatically when the process exits (even on crash).
+    """
+    global _INSTANCE_LOCK
+    lock_path = config.paths.raw_dir.parent / ".instance.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+")  # noqa: SIM115 - held open for process lifetime
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise SystemExit(
+            f"Another TradeBot instance is already running (lock: {lock_path}). "
+            "Stop it first (Ctrl+C in its terminal)."
+        ) from None
+    fh.seek(0, os.SEEK_END)
+    fh.write(f"{os.getpid()}\n")
+    fh.flush()
+    _INSTANCE_LOCK = fh
+
+
 def _clean_previous_run(config: Config) -> None:
     """Delete logs/data left by previous process runs (fresh-state policy).
 
     Runs before the bot (and its recorder) is constructed, so every launch
     starts from an empty raw/reports state. Only files are removed —
     .gitkeep placeholders and subdirectories are kept.
+
+    Before the wipe, signals/trades CSVs and books/matches JSONL (gzipped)
+    are archived into data/calib so multi-day calibration data survives
+    restarts.
     """
+    calib_dir = config.paths.raw_dir.parent / "calib"
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    archived = 0
+    if config.paths.raw_dir.is_dir():
+        for pattern in ("signals*.csv", "trades*.csv", "books*.jsonl", "matches*.jsonl"):
+            for path in sorted(config.paths.raw_dir.glob(pattern)):
+                if not path.is_file() or path.stat().st_size == 0:
+                    continue
+                try:
+                    calib_dir.mkdir(parents=True, exist_ok=True)
+                    if path.suffix == ".jsonl":
+                        dest = calib_dir / f"{path.stem}_{stamp}.jsonl.gz"
+                        with path.open("rb") as src, gzip.open(dest, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                    else:
+                        dest = calib_dir / f"{path.stem}_{stamp}{path.suffix}"
+                        shutil.copy2(path, dest)
+                    archived += 1
+                except OSError:
+                    logger.debug("Could not archive %s", path, exc_info=True)
+    if archived:
+        logger.info(
+            "Archived %d previous-run file(s) to %s (kept across restarts)",
+            archived,
+            calib_dir,
+        )
+
     removed = 0
     for directory in (config.paths.raw_dir, config.paths.reports_dir):
         if not directory.is_dir():
@@ -691,6 +828,7 @@ async def _amain(config_path: str, duration_sec: float | None) -> None:
         datefmt="%H:%M:%S",
     )
 
+    _acquire_instance_lock(config)
     _clean_previous_run(config)
 
     bot = TradingBot(config)

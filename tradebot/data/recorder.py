@@ -4,9 +4,44 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Fixed schema shared by both signal emitters (see main._record_signal*).
+# A fixed header means one emitter adding a key can never silently break
+# every subsequent DictWriter.writerow call.
+_SIGNAL_FIELDS = [
+    "ts",
+    "score",
+    "raw_score",
+    "depth_imbalance",
+    "micro_m",
+    "ofi_z",
+    "mid",
+    "spread_pct",
+    "net_edge",
+    "persistent",
+    "dominant",
+    "action",
+]
+
+_write_errors = 0
+
+
+def _log_write_error(path: Path) -> None:
+    """Disk-full / AV-lock errors must never kill the WS callback chain."""
+    global _write_errors
+    _write_errors += 1
+    if _write_errors <= 5 or _write_errors % 1000 == 0:
+        logger.warning(
+            "Recorder write failed (%d time(s) so far) for %s",
+            _write_errors,
+            path.name,
+        )
 
 
 class RawDataRecorder:
@@ -41,25 +76,31 @@ class RawDataRecorder:
         return candidate
 
     def record_book(self, payload: dict[str, Any]) -> None:
-        row = {"ts": time.time(), **payload}
-        self._append_jsonl(self._book_path, row)
+        # Recorder stamp goes last so it always wins over a payload "ts".
+        self._append_jsonl(self._book_path, {**payload, "ts": time.time()})
 
     def record_matches(self, payload: dict[str, Any]) -> None:
-        row = {"ts": time.time(), **payload}
-        self._append_jsonl(self._matches_path, row)
+        self._append_jsonl(self._matches_path, {**payload, "ts": time.time()})
 
     def record_signal(self, row: dict[str, Any]) -> None:
         write_header = not self._signals_initialized
-        fieldnames = list(row.keys())
-        with self._signal_path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            if write_header:
-                writer.writeheader()
+        try:
+            with self._signal_path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=_SIGNAL_FIELDS, extrasaction="ignore"
+                )
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
                 self._signals_initialized = True
-            writer.writerow(row)
+        except OSError:
+            _log_write_error(self._signal_path)
 
     @staticmethod
     def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, ensure_ascii=False, default=str))
-            handle.write("\n")
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False, default=str))
+                handle.write("\n")
+        except OSError:
+            _log_write_error(path)

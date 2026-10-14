@@ -18,6 +18,7 @@ class DashboardState:
         self._history: deque[dict[str, Any]] = deque(maxlen=max_history)
         self._actions: deque[dict[str, Any]] = deque(maxlen=300)
         self._matches: deque[dict[str, Any]] = deque(maxlen=300)
+        self._match_ids: dict[str, float] = {}  # trade id -> ts (dedup)
         self._trades: deque[dict[str, Any]] = deque(maxlen=100)
         self._params: dict[str, Any] = {}
         self._last_book: dict[str, Any] = {}
@@ -28,7 +29,8 @@ class DashboardState:
         self._last_point_ts = 0.0
         self._known_trades = 0
         self._seq = 0
-        self._started_at = time.time()
+        self._run_id = 0
+        self._run_started_at = time.time()
         self._account: dict[str, Any] = {}
         self._status: dict[str, Any] = {
             "running": False,
@@ -49,9 +51,12 @@ class DashboardState:
 
     def reset_run_data(self) -> None:
         """Clear per-run buffers so a new symbol/run starts clean."""
+        self._run_id += 1
+        self._run_started_at = time.time()
         self._history.clear()
         self._actions.clear()
         self._matches.clear()
+        self._match_ids.clear()
         self._trades.clear()
         self._features = {}
         self._position = {}
@@ -77,13 +82,31 @@ class DashboardState:
         matches = payload.get("matches")
         if not isinstance(matches, list):
             return
-        for item in matches:
+        # The channel publishes newest-first; ingest in chronological order
+        # so the tail of the deque holds the newest trades. Republished ids
+        # (rolling window) are dropped so the tape shows each trade once.
+        if len(self._match_ids) > 1000:
+            cutoff = time.time() - 600
+            self._match_ids = {
+                k: v for k, v in self._match_ids.items() if v >= cutoff
+            }
+        for item in reversed(matches):
             if not isinstance(item, dict):
                 continue
+            item_time = item.get("time")
+            try:
+                ts = float(item_time) if item_time is not None else time.time()
+            except (TypeError, ValueError):
+                ts = time.time()
+            match_id = str(item.get("id", ""))
+            if match_id:
+                if match_id in self._match_ids:
+                    continue
+                self._match_ids[match_id] = ts
             try:
                 self._matches.append(
                     {
-                        "ts": time.time(),
+                        "ts": ts,
                         "price": float(item["price"]),
                         "amount": float(item["base_amount"]),
                         "side": str(item.get("side", "")),
@@ -136,6 +159,17 @@ class DashboardState:
         self._account = self._account_payload(engine, book)
         self._last_book = self._book_payload(book, now)
         self._maybe_append_point(book, now)
+
+    def sync_engine(self, engine: Any, book: OrderBook, now: float) -> None:
+        """Refresh position/trades/account once outside the eval loop.
+
+        Used on shutdown so a force-closed position does not linger on the
+        dashboard as a live OPEN trade after trading has stopped.
+        """
+        self._sync_trades(engine)
+        self._position = self._position_payload(engine, book, now)
+        self._account = self._account_payload(engine, book)
+        self._last_book = self._book_payload(book, now)
 
     # ------------------------------------------------------------------
     # Payload builders
@@ -367,8 +401,9 @@ class DashboardState:
         )
         return {
             "seq": self._seq,
+            "run_id": self._run_id,
             "ts": time.time(),
-            "uptime_sec": time.time() - self._started_at,
+            "uptime_sec": time.time() - self._run_started_at,
             "params": self._params,
             "status": self._status,
             "book": self._last_book,

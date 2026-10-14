@@ -100,6 +100,7 @@ risk:
   max_daily_loss_irt: 1000000
   # ^ Testing: effectively disabled (equals the full initial capital, so the
   #   halt never triggers). Restore to e.g. 20000.0 for realistic sessions.
+  #   The daily window resets at Tehran midnight (UTC+3:30, no DST).
   # Measured spread: p50 ~16 bps, p90 ~19 bps, max ~28 bps. The 60 bps gate
   # therefore almost never blocks; tighten once the strategy is validated.
   max_spread_pct: 0.006

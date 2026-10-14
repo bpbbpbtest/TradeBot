@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _SSE_INTERVAL_SEC = 0.8
+_CONTROL_TIMEOUT_SEC = 30.0
+_SYMBOL_RE = re.compile(r"[A-Z0-9_]{1,20}")
 
 
 class DashboardServer:
@@ -40,6 +43,7 @@ class DashboardServer:
         self._server: asyncio.Server | None = None
         self._index_html: bytes = b""
         self._index_mtime: int = 0
+        self._sse_tasks: set[asyncio.Task] = set()
 
     @property
     def state(self) -> DashboardState:
@@ -64,10 +68,18 @@ class DashboardServer:
         logger.info("Dashboard: http://%s:%d", self._host, self._port)
 
     async def stop(self) -> None:
+        # On Python >= 3.12.1 wait_closed() waits for handler coroutines to
+        # finish; a live SSE loop never finishes on its own, so cancel the
+        # SSE tasks first or shutdown deadlocks whenever a browser is open.
+        for task in list(self._sse_tasks):
+            task.cancel()
+        if self._sse_tasks:
+            await asyncio.gather(*self._sse_tasks, return_exceptions=True)
+        self._sse_tasks.clear()
         if self._server is not None:
             self._server.close()
             try:
-                await self._server.wait_closed()
+                await asyncio.wait_for(self._server.wait_closed(), timeout=5)
             except Exception:  # noqa: BLE001
                 logger.debug("Dashboard server close failed", exc_info=True)
             self._server = None
@@ -106,9 +118,17 @@ class DashboardServer:
 
             if method == "GET" and path in ("/", "/index.html"):
                 self._refresh_index()
-                await self._send_bytes(
-                    writer, self._index_html, "text/html; charset=utf-8"
-                )
+                if not self._index_html:
+                    await self._send_bytes(
+                        writer,
+                        b"index.html missing or unreadable",
+                        "text/plain; charset=utf-8",
+                        status=500,
+                    )
+                else:
+                    await self._send_bytes(
+                        writer, self._index_html, "text/html; charset=utf-8"
+                    )
             elif method == "GET" and path == "/api/state":
                 await self._send_json(writer, self._state.tick())
             elif method == "GET" and path == "/api/history":
@@ -159,13 +179,25 @@ class DashboardServer:
             except json.JSONDecodeError:
                 pass
         symbol = payload.get("symbol")
+        if symbol is not None:
+            if not isinstance(symbol, str) or not _SYMBOL_RE.fullmatch(
+                symbol.upper().strip()
+            ):
+                await self._send_json(
+                    writer, {"ok": False, "error": f"invalid symbol: {symbol!r}"}
+                )
+                return
+            symbol = symbol.upper().strip()
         if self._controller is None:
             await self._send_json(
                 writer, {"ok": False, "error": "no controller"}
             )
             return
         try:
-            status = await self._controller.start_trading(symbol)
+            status = await asyncio.wait_for(
+                self._controller.start_trading(symbol),
+                timeout=_CONTROL_TIMEOUT_SEC,
+            )
             await self._send_json(writer, {"ok": True, "status": status})
         except Exception as exc:  # noqa: BLE001
             status = self._controller.status()
@@ -185,12 +217,18 @@ class DashboardServer:
             )
             return
         try:
-            status = await self._controller.stop_trading()
+            status = await asyncio.wait_for(
+                self._controller.stop_trading(),
+                timeout=_CONTROL_TIMEOUT_SEC,
+            )
             await self._send_json(writer, {"ok": True, "status": status})
         except Exception as exc:  # noqa: BLE001
             await self._send_json(writer, {"ok": False, "error": str(exc)})
 
     async def _sse_loop(self, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._sse_tasks.add(task)
         headers = (
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/event-stream\r\n"
@@ -201,11 +239,15 @@ class DashboardServer:
         )
         writer.write(headers.encode("latin-1"))
         await writer.drain()
-        while True:
-            payload = json.dumps(self._state.tick(), default=str)
-            writer.write(f"data: {payload}\n\n".encode("utf-8"))
-            await writer.drain()
-            await asyncio.sleep(_SSE_INTERVAL_SEC)
+        try:
+            while True:
+                payload = json.dumps(self._state.tick(), default=str)
+                writer.write(f"data: {payload}\n\n".encode("utf-8"))
+                await writer.drain()
+                await asyncio.sleep(_SSE_INTERVAL_SEC)
+        finally:
+            if task is not None:
+                self._sse_tasks.discard(task)
 
     @staticmethod
     async def _send_bytes(

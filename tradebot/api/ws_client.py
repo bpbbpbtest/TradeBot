@@ -6,6 +6,8 @@ Public channels do not require a user token.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -15,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 BookHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 MatchesHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
+
+_READY_TIMEOUT_SEC = 15.0
 
 
 class _BookHandler(centrifuge.SubscriptionEventHandler):
@@ -27,9 +31,24 @@ class _BookHandler(centrifuge.SubscriptionEventHandler):
         if not isinstance(data, dict):
             logger.debug("Ignoring non-dict orderbook publication")
             return
-        result = self._callback(data)
-        if hasattr(result, "__await__"):
-            await result
+        # Isolate: an exception here would otherwise kill the client's single
+        # message pump and silently stop BOTH channels until a ping timeout.
+        try:
+            result = self._callback(data)
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("orderbook callback failed; publication dropped")
+
+    async def on_error(
+        self, ctx: centrifuge.SubscriptionErrorContext
+    ) -> None:
+        logger.error("orderbook subscription error: %s", ctx)
+
+    async def on_unsubscribed(self, ctx: centrifuge.UnsubscribedContext) -> None:
+        logger.warning("orderbook subscription unsubscribed: %s", ctx)
 
 
 class _MatchesHandler(centrifuge.SubscriptionEventHandler):
@@ -42,9 +61,22 @@ class _MatchesHandler(centrifuge.SubscriptionEventHandler):
         if not isinstance(data, dict):
             logger.debug("Ignoring non-dict matches publication")
             return
-        result = self._callback(data)
-        if hasattr(result, "__await__"):
-            await result
+        try:
+            result = self._callback(data)
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("matches callback failed; publication dropped")
+
+    async def on_error(
+        self, ctx: centrifuge.SubscriptionErrorContext
+    ) -> None:
+        logger.error("matches subscription error: %s", ctx)
+
+    async def on_unsubscribed(self, ctx: centrifuge.UnsubscribedContext) -> None:
+        logger.warning("matches subscription unsubscribed: %s", ctx)
 
 
 class _ClientHandler(centrifuge.ClientEventHandler):
@@ -86,6 +118,12 @@ class BitpinWsClient:
         await self._book_sub.subscribe()
         await self._matches_sub.subscribe()
         await self._client.connect()
+        # connect() never raises on transport failure; wait for the actual
+        # subscription confirmations so callers know the feed is live.
+        await asyncio.gather(
+            self._book_sub.ready(timeout=_READY_TIMEOUT_SEC),
+            self._matches_sub.ready(timeout=_READY_TIMEOUT_SEC),
+        )
         logger.info(
             "WebSocket connected; subscribed to orderbook:%s and matches:%s",
             self._symbol,

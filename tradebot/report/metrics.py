@@ -69,11 +69,19 @@ class ReportWriter:
         row = asdict(trade)
         row["side"] = trade.side.value
         self._append_trade_row(row)
-        equity = account.cash_irt + account.base_holding * (
-            trade.exit_price or trade.entry_price
-        )
+        mark = trade.exit_price or trade.entry_price
+        equity = account.cash_irt + account.base_holding * mark
         self._update_drawdown(equity)
-        self.write_summary(account)
+        self.write_summary(account, mark_price=mark)
+
+    def on_mark(self, equity_irt: float) -> None:
+        """Sample equity for drawdown tracking (called every eval cycle).
+
+        Trade-close sampling alone misses unrealized swings inside an open
+        position, which dominate drawdown for a full-equity long-only book.
+        """
+        if equity_irt > 0:
+            self._update_drawdown(equity_irt)
 
     def _append_trade_row(self, row: dict) -> None:
         write_header = not self._trades_path.exists()
@@ -137,14 +145,22 @@ class ReportWriter:
         mark_price: float | None = None,
     ) -> PerformanceSummary:
         mark = mark_price if mark_price is not None else 0.0
+        if mark <= 0 and account.base_holding > 0:
+            # Never value an open holding at zero (e.g. empty book at
+            # shutdown) — equity would collapse and poison max drawdown.
+            mark = account.avg_entry_price or 0.0
         summary = self.summarize(account, mark_price=mark)
-        self._update_drawdown(summary.final_equity_irt)
+        if account.base_holding <= 1e-9 or mark > 0:
+            self._update_drawdown(summary.final_equity_irt)
         summary.max_drawdown_irt = self._max_drawdown
 
         payload = asdict(summary)
         payload["generated_at"] = time.time()
-        with self._summary_path.open("w", encoding="utf-8") as handle:
+        # Atomic replace so a crash mid-write cannot leave truncated JSON.
+        tmp_path = self._summary_path.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
+        tmp_path.replace(self._summary_path)
         return summary
 
     def log_summary(self, summary: PerformanceSummary) -> None:

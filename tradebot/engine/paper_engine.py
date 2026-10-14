@@ -223,6 +223,27 @@ class PaperEngine:
         fee = quote_received * self._fee_taker
         now = time.time()
 
+        full_exit = filled_volume + 1e-9 >= quantity
+        ratio = min(1.0, filled_volume / quantity) if quantity > 0 else 1.0
+        if not full_exit:
+            # Thin bid side: split the trade so the filled part closes under
+            # this record while the remainder stays open under its own id —
+            # never re-close (and re-append) the same record later.
+            remainder = TradeRecord(
+                trade_id=trade.trade_id + "r",
+                side=trade.side,
+                entry_time=trade.entry_time,
+                entry_price=trade.entry_price,
+                quantity=quantity - filled_volume,
+                quote_spent=trade.quote_spent * (1.0 - ratio),
+                fee_entry=trade.fee_entry * (1.0 - ratio),
+                score_at_entry=trade.score_at_entry,
+            )
+            trade.quantity = filled_volume
+            trade.quote_spent *= ratio
+            trade.fee_entry *= ratio
+            self.account.open_trade = remainder
+
         trade.exit_time = now
         trade.exit_price = avg_price
         trade.quote_received = quote_received
@@ -237,7 +258,7 @@ class PaperEngine:
 
         self.account.cash_irt += quote_received - fee
         self.account.base_holding = max(0.0, quantity - filled_volume)
-        if self.account.base_holding <= 1e-9:
+        if full_exit:
             self.account.base_holding = 0.0
             self.account.state = PositionState.FLAT
             self.account.avg_entry_price = None

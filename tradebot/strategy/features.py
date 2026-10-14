@@ -1,6 +1,6 @@
 """Feature engineering for the order-book imbalance strategy.
 
-Four independent features are computed from the live book and trade tape:
+Four independent features are computed from the live order book:
 
 1. Depth imbalance  I_depth in [-1, 1]  (weighted depth, levels 2..N)
 2. Microprice       M        in [-1, 1]  (best-level size imbalance)
@@ -18,7 +18,6 @@ from dataclasses import dataclass
 
 from tradebot.config import FeatureConfig
 from tradebot.data.orderbook import BookLevel, OrderBook
-from tradebot.data.trades import TradesStream
 
 
 @dataclass
@@ -222,16 +221,13 @@ class SignalPersistence:
 
 
 class FeatureEngine:
-    """Computes all four features from the latest book + trade tape."""
+    """Computes all four features from the latest order book."""
 
-    def __init__(
-        self,
-        config: FeatureConfig,
-        trades: TradesStream,
-    ) -> None:
+    def __init__(self, config: FeatureConfig) -> None:
         self._config = config
-        self._trades = trades
-        self._depth = DepthImbalance(config.depth_levels, config.depth_lambda)
+        self._depth = DepthImbalance(
+            config.depth_levels, config.depth_lambda, config.depth_cap_mult
+        )
         self._micro = MicropriceSignal()
         self._ofi = OFIEstimator(config)
         self._persistence = SignalPersistence(

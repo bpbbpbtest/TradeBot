@@ -19,7 +19,14 @@ import statistics
 import sys
 from pathlib import Path
 
-RAW_GLOB = "data/*/signals*.csv"  # current run (data/raw) + preserved archive (data/calib)
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+
+from tradebot.config import load_config  # noqa: E402
+
+# Current run (data/raw) + preserved archive (data/calib), anchored to the
+# repo so the script works from any working directory.
+RAW_GLOB = str(_REPO_ROOT / "data" / "*" / "signals*.csv")
 HORIZONS = (5, 15, 30, 60, 90, 120, 180, 300, 600, 900)
 SCORE_BUCKETS = (
     (0.00, 0.10),
@@ -29,18 +36,22 @@ SCORE_BUCKETS = (
     (0.40, 0.60),
     (0.60, 1.01),
 )
-FEE_TAKER_BPS = 70.0   # 0.35% enter + 0.35% exit
-FEE_MAKER_BPS = 60.0   # 0.30% enter + 0.30% exit
-SLIPPAGE_BPS = 5.0     # execution.edge_exit_slippage (0.0005)
+# Rows recorded while already in a position / exiting are not entry signals;
+# including them biases the score->move relation toward in-position periods.
+_EXCLUDED_ACTIONS = ("hold:position_open", "exit:", "exit_failed:", "halt:")
+DISPLAY_MIN_N = 5  # exploratory threshold for tables 1/2 (table 3 uses --min-n)
 
 
-def load_rows(pattern: str) -> list[dict]:
+def load_rows(pattern: str) -> tuple[list[dict], int, int]:
     rows: list[dict] = []
+    skipped_files = 0
+    skipped_rows = 0
     for path in sorted(glob.glob(pattern)):
         with open(path, newline="") as fh:
             reader = csv.DictReader(fh)
             cols = reader.fieldnames or []
             if not {"ts", "score", "mid", "persistent"} <= set(cols):
+                skipped_files += 1
                 continue
             for r in reader:
                 try:
@@ -49,9 +60,14 @@ def load_rows(pattern: str) -> list[dict]:
                     mid = float(r["mid"])
                     spread = float(r["spread_pct"]) if r.get("spread_pct") else 0.0
                 except (TypeError, ValueError):
+                    skipped_rows += 1
                     continue
                 if r["persistent"] not in ("True", "False"):
                     continue  # halt/stale rows carry no valid features
+                action = (r.get("action") or "").strip()
+                if action.startswith(_EXCLUDED_ACTIONS):
+                    skipped_rows += 1
+                    continue
                 rows.append(
                     {
                         "file": path,
@@ -62,20 +78,52 @@ def load_rows(pattern: str) -> list[dict]:
                         "persistent": r["persistent"] == "True",
                     }
                 )
-    return rows
+    return rows, skipped_files, skipped_rows
 
 
 def fmt(x: float) -> str:
-    return "  n/a" if math.isnan(x) else f"{x:+7.2f}"
+    return "   n/a  " if math.isnan(x) else f"{x:+8.2f}"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--min-n", type=int, default=25, help="min samples to quote a cell")
     parser.add_argument("--pattern", default=RAW_GLOB)
+    parser.add_argument(
+        "--fee-taker-bps", type=float, default=None,
+        help="round-trip taker fee in bps (default: from config.yaml)",
+    )
+    parser.add_argument(
+        "--fee-maker-bps", type=float, default=None,
+        help="round-trip maker fee in bps (default: from config.yaml)",
+    )
+    parser.add_argument(
+        "--slippage-bps", type=float, default=None,
+        help="one-way slippage assumption in bps (default: from config.yaml)",
+    )
     args = parser.parse_args()
 
-    rows = load_rows(args.pattern)
+    # Costs come from the live config so calibration can never silently
+    # diverge from what the bot actually charges. CLI flags allow
+    # hypothetical fee schedules ("what fee would make this viable?").
+    cfg = load_config(_REPO_ROOT / "config.yaml")
+    fee_taker_bps = (
+        args.fee_taker_bps
+        if args.fee_taker_bps is not None
+        else cfg.edge.default_fee_taker * 2 * 1e4
+    )
+    fee_maker_bps = (
+        args.fee_maker_bps
+        if args.fee_maker_bps is not None
+        else cfg.edge.default_fee_maker * 2 * 1e4
+    )
+    slippage_bps = (
+        args.slippage_bps
+        if args.slippage_bps is not None
+        else cfg.execution.edge_exit_slippage * 1e4
+    )
+
+    rows, skipped_files, skipped_rows = load_rows(args.pattern)
     if not rows:
         print("No usable signal rows found.", file=sys.stderr)
         return 1
@@ -99,8 +147,11 @@ def main() -> int:
     n_persist = sum(1 for r in rows if r["persistent"])
     print(f"rows={n_total} (valid features) | score>0 (long side): {n_long} | "
           f"persistent=True: {n_persist} | files={len(files)}")
-    print(f"cost model: taker={FEE_TAKER_BPS + SLIPPAGE_BPS:.0f} bps + spread | "
-          f"maker={FEE_MAKER_BPS + SLIPPAGE_BPS:.0f} bps")
+    if skipped_files or skipped_rows:
+        print(f"skipped: {skipped_files} file(s) without required columns, "
+              f"{skipped_rows} malformed/in-position row(s)")
+    print(f"cost model (from config.yaml): taker={fee_taker_bps + slippage_bps:.0f} bps "
+          f"+ spread | maker={fee_maker_bps + slippage_bps:.0f} bps")
     print("NOTE: rows are ~1.7s apart and autocorrelated; 'episodes' counts "
           "contiguous groups (gap>15s starts a new one) as a lower bound on "
           "independent samples.\n")
@@ -133,7 +184,9 @@ def main() -> int:
                 if j >= len(frows):
                     continue
                 gap = frows[j]["ts"] - target
-                if gap > max(8.0, h * 0.3):
+                # Tight tolerance so a "30s" return is really ~30s: the old
+                # max(8, h*0.3) admitted samples spanning eval gaps/staleness.
+                if gap > max(2.0, min(30.0, h * 0.1)):
                     continue
                 fwd = (frows[j]["mid"] - frows[i]["mid"]) / frows[i]["mid"] * 1e4
                 cells.setdefault((b, h), []).append(
@@ -144,13 +197,17 @@ def main() -> int:
 
     # ---- table 1: mean forward move (bps) by score bucket x horizon ----
     print("Mean forward mid move (bps), |score| buckets x horizon [s]:")
-    header = "bucket      " + "".join(f"{h:>8}s" for h in HORIZONS)
+    header = "bucket      " + "".join(f"{h:>7}s" for h in HORIZONS)
     print(header)
     for b, (lo, hi) in enumerate(SCORE_BUCKETS):
         line = f"[{lo:.2f},{hi:.2f})"
         for h in HORIZONS:
             vals = [v[0] for v in cells.get((b, h), [])]
-            line += f"{fmt(statistics.mean(vals)) if vals else '     -'}" if len(vals) >= 5 else "      -"
+            line += (
+                f"{fmt(statistics.mean(vals))}"
+                if len(vals) >= DISPLAY_MIN_N
+                else "       -"
+            )
         print(line)
 
     # ---- table 2: persistence-only subset (entry-like rows) ----
@@ -160,7 +217,11 @@ def main() -> int:
         line = f"[{lo:.2f},{hi:.2f})"
         for h in HORIZONS:
             vals = [v[0] for v in cells.get((b, h), []) if v[2]]
-            line += f"{fmt(statistics.mean(vals)) if len(vals) >= 5 else '      -'}"
+            line += (
+                f"{fmt(statistics.mean(vals))}"
+                if len(vals) >= DISPLAY_MIN_N
+                else "       -"
+            )
         print(line)
 
     # ---- table 3: net expectancy at the most promising horizons ----
@@ -177,8 +238,8 @@ def main() -> int:
             episodes = len({v[3] for v in vals})
             spread = statistics.median(v[1] for v in vals)
             mean = statistics.mean(fwds)
-            net_taker = mean - (FEE_TAKER_BPS + spread + SLIPPAGE_BPS)
-            net_maker = mean - (FEE_MAKER_BPS + SLIPPAGE_BPS)
+            net_taker = mean - (fee_taker_bps + spread + slippage_bps)
+            net_maker = mean - (fee_maker_bps + slippage_bps)
             win = sum(1 for x in fwds if x > 0) / len(fwds) * 100
             print(f"[{lo:.2f},{hi:.2f}){h:>5}{len(vals):>6}{episodes:>6}{mean:>9.2f}"
                   f"{statistics.median(fwds):>9.2f}{win:>7.1f}{spread:>7.2f}"

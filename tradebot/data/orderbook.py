@@ -7,8 +7,10 @@ by wall-clock age of the last accepted snapshot.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -98,11 +100,7 @@ class OrderBookState:
         if not asks or not bids:
             return False
 
-        event_time = raw.get("event_time") or raw.get("time") or 0.0
-        try:
-            event_ts = float(event_time)
-        except (TypeError, ValueError):
-            event_ts = 0.0
+        event_ts = self._parse_event_time(raw.get("event_time") or raw.get("time"))
 
         self.book = OrderBook(
             bids=bids,
@@ -121,6 +119,19 @@ class OrderBookState:
         return ok
 
     @staticmethod
+    def _parse_event_time(value: object) -> float:
+        """Exchange event_time is ISO-8601 UTC ('...Z'); time may be epoch."""
+        if isinstance(value, str) and value:
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return 0.0
+        try:
+            return float(value) if value is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
     def _parse_levels(
         raw_levels: object,
         descending: bool,
@@ -131,8 +142,13 @@ class OrderBookState:
         for entry in raw_levels:
             if not isinstance(entry, (list, tuple)) or len(entry) < 2:
                 continue
-            price = float(entry[0])
-            volume = float(entry[1])
+            try:
+                price = float(entry[0])
+                volume = float(entry[1])
+            except (TypeError, ValueError):
+                continue  # one bad level must not reject the whole snapshot
+            if not math.isfinite(price) or not math.isfinite(volume):
+                continue
             if price <= 0 or volume <= 0:
                 continue
             levels.append(BookLevel(price=price, volume=volume))
