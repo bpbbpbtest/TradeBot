@@ -6,6 +6,7 @@ venv/
 data/raw/*.jsonl
 data/raw/signals*.csv
 data/reports/*
+data/calib/
 !data/reports/.gitkeep
 !data/raw/.gitkeep
 *.log

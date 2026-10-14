@@ -11,6 +11,7 @@ Four independent features are computed from the live book and trade tape:
 from __future__ import annotations
 
 import math
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -39,23 +40,37 @@ class Features:
 
 
 class DepthImbalance:
-    """Weighted depth imbalance over levels 2..N (best level skipped)."""
+    """Weighted depth imbalance over levels 2..N (best level skipped).
 
-    def __init__(self, levels: int, decay: float) -> None:
+    Each level volume is capped at ``cap_mult`` x the median volume of the
+    window (both sides) before weighting, so a single spoofed wall cannot
+    dominate the imbalance. ``cap_mult <= 0`` disables the cap.
+    """
+
+    def __init__(self, levels: int, decay: float, cap_mult: float = 10.0) -> None:
         self._levels = max(levels, 2)
         self._decay = decay
+        self._cap_mult = cap_mult
 
     def compute(self, book: OrderBook) -> tuple[float, float]:
         """Return (I_depth, reason). reason is empty on success."""
-        depth_buy = 0.0
-        depth_sell = 0.0
-        for index, level in enumerate(book.bids[1 : self._levels], start=2):
-            weight = self._decay ** (index - 2)
-            depth_buy += weight * level.volume
-        for index, level in enumerate(book.asks[1 : self._levels], start=2):
-            weight = self._decay ** (index - 2)
-            depth_sell += weight * level.volume
-
+        buy_volumes = [lvl.volume for lvl in book.bids[1 : self._levels]]
+        sell_volumes = [lvl.volume for lvl in book.asks[1 : self._levels]]
+        if self._cap_mult > 0:
+            window = buy_volumes + sell_volumes
+            median = statistics.median(window) if window else 0.0
+            cap = self._cap_mult * median
+            if cap > 0:
+                buy_volumes = [min(v, cap) for v in buy_volumes]
+                sell_volumes = [min(v, cap) for v in sell_volumes]
+        depth_buy = sum(
+            self._decay**index * volume
+            for index, volume in enumerate(buy_volumes)
+        )
+        depth_sell = sum(
+            self._decay**index * volume
+            for index, volume in enumerate(sell_volumes)
+        )
         total = depth_buy + depth_sell
         if total <= 0:
             return 0.0, "empty_depth"

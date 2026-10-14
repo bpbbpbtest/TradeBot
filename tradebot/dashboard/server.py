@@ -39,13 +39,25 @@ class DashboardServer:
         self._controller = controller
         self._server: asyncio.Server | None = None
         self._index_html: bytes = b""
+        self._index_mtime: int = 0
 
     @property
     def state(self) -> DashboardState:
         return self._state
 
+    def _refresh_index(self) -> None:
+        """Re-read index.html if it changed on disk (live-edit friendly)."""
+        path = _STATIC_DIR / "index.html"
+        try:
+            mtime = path.stat().st_mtime_ns
+            if mtime != self._index_mtime:
+                self._index_html = path.read_bytes()
+                self._index_mtime = mtime
+        except OSError:
+            logger.debug("index.html reload failed", exc_info=True)
+
     async def start(self) -> None:
-        self._index_html = (_STATIC_DIR / "index.html").read_bytes()
+        self._refresh_index()
         self._server = await asyncio.start_server(
             self._handle, self._host, self._port
         )
@@ -93,6 +105,7 @@ class DashboardServer:
                 )
 
             if method == "GET" and path in ("/", "/index.html"):
+                self._refresh_index()
                 await self._send_bytes(
                     writer, self._index_html, "text/html; charset=utf-8"
                 )

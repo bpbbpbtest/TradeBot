@@ -294,6 +294,7 @@
   }).observe($("price-chart").parentElement);
 
   let lastChartTime = 0, lastPointTs = 0, markersKey = "", paramsKey = "";
+  const chartTimeByTs = new Map();  // floor(original ts) -> chart time (toChartTime may bump)
 
   function toChartTime(ts) {
     let t = Math.floor(ts);
@@ -306,6 +307,10 @@
     if (!p || !p.mid || p.ts <= lastPointTs) return;
     lastPointTs = p.ts;
     const t = toChartTime(p.ts);
+    chartTimeByTs.set(Math.floor(p.ts), t);
+    if (chartTimeByTs.size > 4000) {
+      chartTimeByTs.delete(chartTimeByTs.keys().next().value);
+    }
     priceSeries.update({ time: t, value: p.mid });
     scoreSeries.update({ time: t, value: p.score || 0 });
   }
@@ -316,11 +321,11 @@
     markersKey = key;
     priceSeries.setMarkers(
       markers.map(m => ({
-        time: Math.floor(m.ts),
+        time: chartTimeByTs.get(Math.floor(m.ts)) ?? Math.floor(m.ts),
         position: m.type === "entry" ? "belowBar" : "aboveBar",
         color: m.type === "entry" ? "#3fb950" : "#f85149",
         shape: m.type === "entry" ? "arrowUp" : "arrowDown",
-        text: m.type === "entry" ? "ENTRY" : "EXIT",
+        text: (m.type === "entry" ? "ENTRY " : "EXIT ") + fmt(m.price),
       })).sort((a, b) => a.time - b.time)
     );
   }
@@ -464,14 +469,17 @@
     add("Symbol", pr.symbol);
     add("Capital", fmt(pr.capital_irt) + " IRT");
     add("Eval interval", pr.eval_interval_sec + " s");
+    if (pr.entry && pr.entry.min_score != null) add("Min entry score", pr.entry.min_score);
     const f = pr.features || {};
     add("Depth levels", f.depth_levels);
     add("Depth λ decay", f.depth_lambda);
+    add("Depth cap (× median)", f.depth_cap_mult);
     add("OFI z window", f.ofi_z_window_sec + " s");
     add("Persistence", f.persistence_windows + " × " + f.persistence_window_sec + " s");
     const s = pr.scoring || {};
     add("w(depth / micro / ofi)", `${s.weight_depth} / ${s.weight_micro} / ${s.weight_ofi}`);
     add("OFI tanh scale", s.ofi_scale);
+    add("Score EMA half-life", s.ema_half_life_sec + " s");
     const e = pr.edge || {};
     add("Expected move coef", e.expected_move_coef);
     add("Required edge", e.required_edge);
@@ -485,6 +493,8 @@
     const x = pr.exit || {};
     add("Score exit threshold", x.score_exit_threshold);
     add("Max holding", fmtDur(x.max_holding_sec));
+    if (x.min_hold_sec != null) add("Min hold (score exit)", fmtDur(x.min_hold_sec));
+    if (x.score_exit_windows != null) add("Score exit windows", x.score_exit_windows);
     const c = pr.fees || {};
     if (c.taker != null) add("Taker fee", (c.taker * 100).toFixed(3) + " %");
     if (c.maker != null) add("Maker fee", (c.maker * 100).toFixed(3) + " %");

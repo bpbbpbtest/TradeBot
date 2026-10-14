@@ -39,6 +39,7 @@ class FeatureConfig:
     min_ofi_samples: int
     persistence_windows: int
     persistence_window_sec: float
+    depth_cap_mult: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class ScoringConfig:
     weight_micro: float
     weight_ofi: float
     ofi_scale: float
+    ema_half_life_sec: float = 15.0
 
 
 @dataclass(frozen=True)
@@ -81,9 +83,16 @@ class RiskConfig:
 
 
 @dataclass(frozen=True)
+class EntryConfig:
+    min_score: float
+
+
+@dataclass(frozen=True)
 class ExitConfig:
     score_exit_threshold: float
     max_holding_sec: float
+    min_hold_sec: float = 60.0
+    score_exit_windows: int = 3
 
 
 @dataclass(frozen=True)
@@ -112,6 +121,7 @@ class Config:
     api: ApiConfig
     features: FeatureConfig
     scoring: ScoringConfig
+    entry: EntryConfig
     edge: EdgeConfig
     execution: ExecutionConfig
     position: PositionConfig
@@ -161,6 +171,7 @@ def load_config(config_path: str | Path = "config.yaml") -> Config:
         ),
         features=FeatureConfig(**_section(raw, "features")),
         scoring=ScoringConfig(**_section(raw, "scoring")),
+        entry=EntryConfig(**_section(raw, "entry")),
         edge=EdgeConfig(**_section(raw, "edge")),
         execution=ExecutionConfig(**_section(raw, "execution")),
         position=PositionConfig(**_section(raw, "position")),

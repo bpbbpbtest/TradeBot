@@ -40,6 +40,7 @@ class ExitReason(str, Enum):
     SCORE_REVERSAL = "score_reversal"
     TIME_EXIT = "time_exit"
     MANUAL_RISK = "manual_risk"
+    SHUTDOWN = "shutdown"
 
 
 @dataclass

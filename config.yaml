@@ -8,7 +8,7 @@ market:
   # the dashboard (Stop -> pick symbol -> Start) without editing this file.
   # Note: USDT_IRT is suspended overnight (21:00-09:00 Tehran);
   # USDC_IRT trades 24/7.
-  symbol: USDC_IRT
+  symbol: USDT_IRT
 
 capital:
   initial_irt: 1000000.0
@@ -27,6 +27,9 @@ features:
   depth_levels: 10
   # Exponential weight decay for depth levels: w_i = lambda ** (i - 2)
   depth_lambda: 0.5
+  # Cap each depth level at this multiple of the window median volume so a
+  # single spoofed wall cannot dominate the imbalance (<= 0 disables the cap).
+  depth_cap_mult: 10.0
   # Rolling window (seconds) of OFI snapshots used to z-score current OFI.
   ofi_z_window_sec: 120.0
   min_ofi_samples: 20
@@ -41,11 +44,27 @@ scoring:
   weight_ofi: 0.30
   # Argument scale for tanh(ofi_z / ofi_scale) in the score blend.
   ofi_scale: 2.0
+  # EMA half-life applied to the composite score before persistence/entry/
+  # exit decisions so a single jumpy frame cannot flip them. <= 0 disables.
+  ema_half_life_sec: 15.0
+
+entry:
+  # Minimum composite score required to open a long. Calibration showed
+  # score<0.1 has ~zero forward move while every trade still pays ~70 bps
+  # in round-trip fees; 0.15 keeps only the stronger half of observed
+  # signals (the 0.1-0.2 bucket was already positive at 60-180s horizons).
+  min_score: 0.15
 
 edge:
-  # Estimated mid-price move (fraction) at |score| = 1.0. Placeholder until
-  # calibrated from recorded data in a later phase.
-  expected_move_coef: 0.0004
+  # Calibrated from recorded signals (scripts/calibrate_edge.py, 2026-10-14):
+  # empirical move at |score|=1.0 grows with hold horizon — ~2 bps @5s,
+  # ~12 bps @30s, ~50 bps @60-180s, ~91 bps @300s (only 2-3 independent
+  # episodes so far; re-run after more active-market data). This placeholder
+  # uses the ~30s horizon, matching typical score_reversal exits.
+  # WARNING: even the best observed cell (-46 bps net at maker cost) does
+  # NOT clear round-trip fees (65-75 bps). Do not enable enforce until
+  # episodes >= ~30 show positive net expectancy.
+  expected_move_coef: 0.0012
   # Minimum net edge (fraction) required to open a position.
   required_edge: 0.0002
   # Calibration mode: when false, entries are not blocked by the edge gate
@@ -70,11 +89,19 @@ position:
   max_touch_depth_fraction: 0.5
 
 risk:
-  stop_loss_pct: 0.004
-  take_profit_pct: 0.006
-  max_daily_loss_irt: 20000.0
-  # Observed USDT_IRT spread is often 20-40 bps; keep the gate loose enough
-  # for calibration runs and tighten once the strategy is validated.
+  # Measured on recorded USDT_IRT data (score>=0.15 entries, 900s horizon):
+  # worst adverse excursion -26 bps, best favorable +29 bps, median spread
+  # ~16 bps. Stop sits just beyond the observed tail as a crash guard.
+  stop_loss_pct: 0.0030
+  # Take profit sits where price actually tops out (p90-p95 of favorable
+  # excursions). Note: 25 bps is still below the ~70 bps round-trip fee, so
+  # this only cuts losses earlier; it does not create profit by itself.
+  take_profit_pct: 0.0025
+  max_daily_loss_irt: 1000000
+  # ^ Testing: effectively disabled (equals the full initial capital, so the
+  #   halt never triggers). Restore to e.g. 20000.0 for realistic sessions.
+  # Measured spread: p50 ~16 bps, p90 ~19 bps, max ~28 bps. The 60 bps gate
+  # therefore almost never blocks; tighten once the strategy is validated.
   max_spread_pct: 0.006
   # WS pushes only on change, so quiet markets rely on the REST resync for
   # freshness. Halt only if both streams stay silent beyond this window.
@@ -85,6 +112,15 @@ exit:
   score_exit_threshold: -0.3
   # Time-based exit as a backstop, seconds.
   max_holding_sec: 900.0
+  # No score-based exit during the first N seconds after entry (stop/TP
+  # stay active). Guards against single-eval noise: the score has been
+  # observed to flip +/-0.5 within one ~1.7s eval while mid kept rising.
+  min_hold_sec: 60.0
+  # A score_reversal exit requires the score to stay below the threshold
+  # for this many consecutive evaluations (~1.7s each) before firing.
+  # The streak accrues during min_hold, so a sustained negative score
+  # exits as soon as the min hold allows.
+  score_exit_windows: 3
 
 paths:
   raw_dir: data/raw

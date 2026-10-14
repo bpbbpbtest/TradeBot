@@ -17,6 +17,7 @@ import asyncio
 import logging
 import signal
 import time
+from pathlib import Path
 from typing import Any
 
 from tradebot.api.rest_client import BitpinRestClient, CommissionInfo
@@ -65,6 +66,7 @@ class TradingBot:
         self._trades = TradesStream(window_sec=config.features.ofi_z_window_sec)
         self._features: FeatureEngine | None = None
         self._scorer: Scorer | None = None
+        self._last_raw_score: float = 0.0
         self._edge: EdgeEstimator | None = None
         self._engine: PaperEngine | None = None
         self._risk = RiskManager(config.risk, config.position)
@@ -233,7 +235,7 @@ class TradingBot:
             book = self._book_state.book
             trade = None
             if engine.account.state.value == "long" and book.is_valid():
-                trade = engine.try_exit_long(book, ExitReason.MANUAL_RISK)
+                trade = engine.try_exit_long(book, ExitReason.SHUTDOWN)
                 if trade is not None:
                     self._risk.register_realized_pnl(
                         trade.pnl_irt, time.time()
@@ -313,6 +315,7 @@ class TradingBot:
             "features": {
                 "depth_levels": cfg.features.depth_levels,
                 "depth_lambda": cfg.features.depth_lambda,
+                "depth_cap_mult": cfg.features.depth_cap_mult,
                 "ofi_z_window_sec": cfg.features.ofi_z_window_sec,
                 "min_ofi_samples": cfg.features.min_ofi_samples,
                 "persistence_windows": cfg.features.persistence_windows,
@@ -323,6 +326,10 @@ class TradingBot:
                 "weight_micro": cfg.scoring.weight_micro,
                 "weight_ofi": cfg.scoring.weight_ofi,
                 "ofi_scale": cfg.scoring.ofi_scale,
+                "ema_half_life_sec": cfg.scoring.ema_half_life_sec,
+            },
+            "entry": {
+                "min_score": cfg.entry.min_score,
             },
             "edge": {
                 "expected_move_coef": cfg.edge.expected_move_coef,
@@ -339,6 +346,8 @@ class TradingBot:
             "exit": {
                 "score_exit_threshold": cfg.exit.score_exit_threshold,
                 "max_holding_sec": cfg.exit.max_holding_sec,
+                "min_hold_sec": cfg.exit.min_hold_sec,
+                "score_exit_windows": cfg.exit.score_exit_windows,
             },
             "execution": {
                 "max_levels_walk": cfg.execution.max_levels_walk,
@@ -410,8 +419,9 @@ class TradingBot:
 
         # --- Features + score ---
         feats = features_engine.compute(book, now)
-        score_result = scorer.compute(feats)
+        score_result = scorer.compute(feats, now)
         score = score_result.score if score_result.valid else 0.0
+        self._last_raw_score = score_result.raw_score if score_result.valid else 0.0
 
         features_engine.persistence.update(score, now)
         persistent = features_engine.persistence.is_persistent()
@@ -421,12 +431,13 @@ class TradingBot:
             self._last_status_at = now
             logger.info(
                 "status %s mid=%.0f spread=%.0f bps book_age=%.1fs score=%+.3f "
-                "persistent=%s pos=%s equity=%.0f IRT",
+                "raw=%+.3f persistent=%s pos=%s equity=%.0f IRT",
                 self._symbol,
                 feats.mid,
                 feats.spread_pct * 10000 if feats.valid else -1,
                 book.age_sec(now),
                 score,
+                self._last_raw_score,
                 persistent,
                 engine.account.state.value,
                 engine.equity_irt(book),
@@ -478,6 +489,13 @@ class TradingBot:
                 persistent, dominant,
             )
             return
+        if score < self._config.entry.min_score:
+            # Too weak to pay for round-trip fees (see calibration).
+            self._record_signal(
+                feats, score, edge_estimator, now, "wait:min_score",
+                persistent, dominant,
+            )
+            return
 
         edge = edge_estimator.estimate(feats, score)
         if not edge.valid or not edge.passes_gate:
@@ -526,6 +544,7 @@ class TradingBot:
             {
                 "ts": now,
                 "score": round(score, 6),
+                "raw_score": round(self._last_raw_score, 6),
                 "depth_imbalance": round(feats.depth_imbalance, 6),
                 "micro_m": round(feats.micro_m, 6),
                 "ofi_z": round(feats.ofi_z, 6),
@@ -545,6 +564,7 @@ class TradingBot:
             {
                 "ts": now,
                 "score": "",
+                "raw_score": "",
                 "depth_imbalance": "",
                 "micro_m": "",
                 "ofi_z": "",
@@ -631,6 +651,37 @@ class TradingBot:
         self._stop_event.set()
 
 
+def _clean_previous_run(config: Config) -> None:
+    """Delete logs/data left by previous process runs (fresh-state policy).
+
+    Runs before the bot (and its recorder) is constructed, so every launch
+    starts from an empty raw/reports state. Only files are removed —
+    .gitkeep placeholders and subdirectories are kept.
+    """
+    removed = 0
+    for directory in (config.paths.raw_dir, config.paths.reports_dir):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                logger.debug("Could not remove previous-run file %s", path, exc_info=True)
+    for log_file in sorted(Path.cwd().glob("*.log")):
+        try:
+            log_file.unlink()
+            removed += 1
+        except OSError:
+            # e.g. still open because the process was started with shell redirect
+            logger.debug("Could not remove previous log %s", log_file, exc_info=True)
+    logger.info(
+        "Fresh start: removed %d file(s) from previous run(s)", removed
+    )
+
+
 async def _amain(config_path: str, duration_sec: float | None) -> None:
     config = load_config(config_path)
 
@@ -639,6 +690,8 @@ async def _amain(config_path: str, duration_sec: float | None) -> None:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    _clean_previous_run(config)
 
     bot = TradingBot(config)
 
@@ -671,7 +724,11 @@ def main() -> None:
         help="Optional run duration in seconds; runs forever if omitted",
     )
     args = parser.parse_args()
-    asyncio.run(_amain(args.config, args.duration))
+    try:
+        asyncio.run(_amain(args.config, args.duration))
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        raise SystemExit(0) from None
 
 
 if __name__ == "__main__":
