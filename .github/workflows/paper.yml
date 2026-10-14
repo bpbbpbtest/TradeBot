@@ -1,10 +1,17 @@
 name: Paper trading
 
 on:
+  schedule:
+    # Market windows in Tehran (UTC+3:30):
+    #   09:00-15:00 Tehran = 05:30-11:30 UTC
+    #   15:00-21:00 Tehran = 11:30-17:30 UTC
+    # Outside these windows the IRT (tether) market is closed.
+    - cron: "30 5 * * *"
+    - cron: "30 11 * * *"
   workflow_dispatch:
     inputs:
       duration_sec:
-        description: "Run duration in seconds (max 21000 = 6h)"
+        description: "Run duration in seconds (max 21000)"
         required: false
         default: "3600"
       wait_sec:
@@ -13,7 +20,7 @@ on:
         default: "30"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   paper:
@@ -46,6 +53,7 @@ jobs:
           echo "::notice title=Runner IP for Bitpin whitelist::${IP}"
 
       - name: Wait for manual IP whitelist
+        if: github.event_name == 'workflow_dispatch'
         env:
           WAIT: ${{ github.event.inputs.wait_sec || '30' }}
         run: |
@@ -56,7 +64,9 @@ jobs:
         env:
           BITPIN_API_KEY: ${{ secrets.BITPIN_API_KEY }}
           BITPIN_SECRET_KEY: ${{ secrets.BITPIN_SECRET_KEY }}
-          DURATION: ${{ github.event.inputs.duration_sec || '3600' }}
+          # Scheduled runs cover the full market window minus a safety margin
+          # so the job can archive and push before the 6h runner limit.
+          DURATION: ${{ github.event_name == 'schedule' && '20400' || (github.event.inputs.duration_sec || '3600') }}
         run: |
           python -m tradebot.main --duration "$DURATION"
 
@@ -66,6 +76,57 @@ jobs:
             echo "::error::summary.json missing — the bot never completed a run"
             exit 1
           fi
+
+      - name: Archive run into runs/ and push
+        if: always()
+        env:
+          DURATION: ${{ github.event_name == 'schedule' && '20400' || (github.event.inputs.duration_sec || '3600') }}
+        run: |
+          set -euo pipefail
+          TEH_DATE=$(TZ=Asia/Tehran date +%Y-%m-%d)
+          TEH_TIME=$(TZ=Asia/Tehran date +%H:%M)
+          SLOT=$(TZ=Asia/Tehran date +%H%M)
+          RUN_DIR="runs/${TEH_DATE}_${SLOT}"
+          mkdir -p "$RUN_DIR"
+
+          # Raw recordings (signals/trades CSVs, books/matches streams)
+          for f in data/raw/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.gitkeep) continue ;; esac
+            cp "$f" "$RUN_DIR/"
+          done
+          # Compress bulky jsonl streams to keep the repo small
+          for f in "$RUN_DIR"/*.jsonl; do
+            [ -f "$f" ] && gzip -f "$f" || true
+          done
+
+          # Reports (summary.json, equity curves, metrics)
+          if [ -d data/reports ]; then
+            for f in data/reports/*; do
+              [ -f "$f" ] || continue
+              case "$f" in *.gitkeep) continue ;; esac
+              cp "$f" "$RUN_DIR/"
+            done
+          fi
+
+          {
+            echo "run_id=${{ github.run_id }}"
+            echo "event=${{ github.event_name }}"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "duration_sec=${DURATION}"
+            echo "window_tehran=${TEH_DATE} ${TEH_TIME} (approx start)"
+          } > "$RUN_DIR/meta.txt"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$RUN_DIR"
+          if git diff --cached --quiet; then
+            echo "Nothing to archive for ${RUN_DIR}"
+            exit 0
+          fi
+          git commit -m "Archive paper run ${RUN_DIR} (Tehran window)"
+          git push origin main
+          echo "Archived and pushed ${RUN_DIR}"
 
       - name: Upload data and reports
         if: always()
