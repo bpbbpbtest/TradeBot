@@ -48,8 +48,7 @@
     font-size: 11px; color: var(--muted); text-transform: uppercase;
     letter-spacing: .08em; margin-bottom: 8px; font-weight: 600;
   }
-  #price-chart { height: 300px; }
-  #score-chart { height: 110px; }
+  #price-chart { height: 340px; }
   .gauge-row { display: grid; grid-template-columns: 90px 1fr 60px; gap: 8px; align-items: center; margin: 5px 0; }
   .gauge-label { font-size: 11px; color: var(--muted); }
   .gauge {
@@ -152,12 +151,8 @@
   <!-- LEFT: charts + features -->
   <div style="display:flex; flex-direction:column; gap:10px;">
     <div class="panel">
-      <h3>Price (mid) &amp; trade markers</h3>
+      <h3>Price (mid) &amp; score — dual auto-scale</h3>
       <div id="price-chart"></div>
-    </div>
-    <div class="panel">
-      <h3>Score</h3>
-      <div id="score-chart"></div>
     </div>
     <div class="panel">
       <h3>Signal components</h3>
@@ -294,22 +289,26 @@
   const chartOpts = {
     layout: { background: { type: "solid", color: "#0d1117" }, textColor: "#8b949e", fontSize: 11, attributionLogo: false },
     grid: { vertLines: { color: "#21262d" }, horzLines: { color: "#21262d" } },
-    rightPriceScale: { borderColor: "#30363d" },
+    leftPriceScale: { visible: true, borderColor: "#30363d", scaleMargins: { top: 0.15, bottom: 0.15 } },
+    rightPriceScale: { visible: true, borderColor: "#30363d", scaleMargins: { top: 0.1, bottom: 0.1 } },
     timeScale: { borderColor: "#30363d", timeVisible: true, secondsVisible: true, rightOffset: 4 },
     crosshair: { mode: 0 },
   };
-  const priceChart = LightweightCharts.createChart($("price-chart"), chartOpts);
+  const priceChart = LightweightCharts.createChart($("price-chart"), { ...chartOpts, height: 340 });
   const priceSeries = priceChart.addAreaSeries({
+    priceScaleId: "right",
     lineColor: "#58a6ff", topColor: "rgba(88,166,255,0.25)",
     bottomColor: "rgba(88,166,255,0.02)", lineWidth: 2, priceLineVisible: false,
   });
-  const scoreChart = LightweightCharts.createChart($("score-chart"), { ...chartOpts, height: 110 });
-  const scoreSeries = scoreChart.addLineSeries({ color: "#d29922", lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+  // Score: same chart, auto-scaled left axis with visible value labels.
+  const scoreSeries = priceChart.addLineSeries({
+    priceScaleId: "left", color: "#d29922", lineWidth: 2,
+    priceLineVisible: false, lastValueVisible: true,
+  });
   scoreSeries.createPriceLine({ price: 0, color: "#30363d", lineWidth: 1, lineStyle: 0, axisLabelVisible: false });
   new ResizeObserver(() => {
-    const p = $("price-chart"), s = $("score-chart");
-    priceChart.applyOptions({ width: p.clientWidth, height: 300 });
-    scoreChart.applyOptions({ width: s.clientWidth, height: 110 });
+    const p = $("price-chart");
+    priceChart.applyOptions({ width: p.clientWidth, height: 340 });
   }).observe($("price-chart").parentElement);
 
   let lastChartTime = 0, lastPointTs = 0, markersKey = "", paramsKey = "", lastRunId = -1;
