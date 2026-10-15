@@ -6,6 +6,8 @@ on:
     #   09:00-15:00 Tehran = 05:30-11:30 UTC
     #   15:00-21:00 Tehran = 11:30-17:30 UTC
     # Outside these windows the IRT (tether) market is closed.
+    # Re-registered 2026-10-15: the 05:30 UTC run was dropped by the
+    # GitHub scheduler (documented under high load); keep crons off :00.
     - cron: "30 5 * * *"
     - cron: "30 11 * * *"
   workflow_dispatch:
