@@ -1,0 +1,2 @@
+trade_id,side,entry_time,entry_price,quantity,quote_spent,fee_entry,score_at_entry,exit_time,exit_price,quote_received,fee_exit,exit_reason,pnl_irt
+e5cb7ee1a041,buy,1792058666.7848005,266494.0,3.7524296982296037,1000000.0,3500.0,0.2961968017884255,1792058736.8539665,266354.0,999474.6598422478,3498.1613094478676,score_reversal,-7523.501467200025

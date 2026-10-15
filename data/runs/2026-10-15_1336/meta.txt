@@ -1,0 +1,5 @@
+run_id=38717572095
+event=workflow_dispatch
+commit=3a174b4dceec4fe9d485c42e676193d615eeddb1
+duration_sec=900
+window_tehran=2026-10-15 13:36 (approx start)

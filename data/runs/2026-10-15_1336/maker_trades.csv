@@ -1,0 +1,2 @@
+trade_id,signal_ts,entry_ts,entry_price,qty,quote_spent,fee_entry,exit_ts,exit_price,fee_exit,exit_kind,pnl_irt,net_bps,holding_sec,fill_latency_sec,repeg_count,score_at_entry
+M1,1792058666.785,1792058669.498,266443.0,3.753148,1000000.0,3000.0,1792058736.853,266220.82,3497.08,score_reversal,-7330.94,-73.31,67.4,2.7,0,"(0.2871,)"
