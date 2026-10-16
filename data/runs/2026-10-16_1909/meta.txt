@@ -1,0 +1,5 @@
+run_id=38884158960
+event=schedule
+commit=8a7e9fee4e992b40ce09f4624b20ef458dee924f
+duration_sec=20400
+window_tehran=2026-10-16 19:09 (approx start)
