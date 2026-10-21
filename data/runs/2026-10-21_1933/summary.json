@@ -1,0 +1,20 @@
+{
+  "total_trades": 24,
+  "winning_trades": 0,
+  "losing_trades": 24,
+  "win_rate": 0.0,
+  "total_pnl_irt": -147440.99395135825,
+  "total_fees_irt": 149038.20115720492,
+  "avg_pnl_irt": -6143.37474797326,
+  "best_trade_irt": -1303.2695999999999,
+  "worst_trade_irt": -8033.721491674726,
+  "max_drawdown_irt": 147589.94606155378,
+  "final_equity_irt": 902559.0060486419,
+  "initial_capital_irt": 1050000.0,
+  "return_pct": -0.1404199942393887,
+  "exit_reason_counts": {
+    "time_exit": 7,
+    "score_reversal": 17
+  },
+  "generated_at": 1792598587.2814758
+}
